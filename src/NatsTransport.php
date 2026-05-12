@@ -27,10 +27,8 @@ use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Stamp\ErrorDetailsStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
-use Symfony\Component\Messenger\Transport\Receiver\KeepaliveReceiverInterface;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
-use Symfony\Component\Messenger\Transport\CloseableTransportInterface;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\SetupableTransportInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;
@@ -49,7 +47,7 @@ use Symfony\Component\Uid\Uuid;
  * @see NatsTransportFactory     Creates instances of this transport from Symfony DSN configuration.
  * @see NatsTransportConfiguration  Holds the resolved, immutable runtime settings.
  */
-class NatsTransport implements TransportInterface, MessageCountAwareInterface, SetupableTransportInterface, KeepaliveReceiverInterface, CloseableTransportInterface
+class NatsTransport implements TransportInterface, MessageCountAwareInterface, SetupableTransportInterface
 {
     /** Conversion factor for stream max_age (seconds → nanoseconds as required by JetStream API). */
     private const SECONDS_TO_NANOSECONDS = 1_000_000_000;

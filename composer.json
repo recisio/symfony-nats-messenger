@@ -36,7 +36,7 @@
         "phpunit/phpunit": "^10.5 || ^11",
         "phpstan/phpstan": "^2.1",
         "dg/bypass-finals": "^1.9",
-        "infection/infection": "^0.32"
+        "infection/infection": "^0.29 || ^0.30 || ^0.31"
     },
     "scripts": {
         "analyse": "phpstan analyse --configuration phpstan.neon.dist",
