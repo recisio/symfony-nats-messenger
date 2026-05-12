@@ -75,7 +75,7 @@ final class NatsTransportConfigurationBuilder
      *
      * @param array<string, mixed> $options
      */
-    public function build(#[\SensitiveParameter] string $dsn, array $options = []): NatsTransportConfiguration
+    public function build(string $dsn, array $options = []): NatsTransportConfiguration
     {
         $components = $this->parseDsn($dsn);
         $configuration = $this->buildConfiguration($components, $options);

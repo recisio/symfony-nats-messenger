@@ -1,15 +1,15 @@
 # Symfony NATS Messenger Bridge
 
-[![PHP Version](https://img.shields.io/badge/PHP-^8.2-787CB5?logo=php&logoColor=white)](https://php.net)
-[![Symfony Version](https://img.shields.io/badge/Symfony-^7.2%20%7C%20^8.0-000000?logo=symfony&logoColor=white)](https://symfony.com)
-[![Unit Tests Coverage](https://img.shields.io/badge/Coverage-99.58%25-brightgreen)](https://github.com/ideaconnect/symfony-nats-messenger/actions)
-[![Mutation MSI](https://img.shields.io/badge/Mutation%20MSI-100%25-brightgreen)](https://infection.github.io/)
+[![PHP Version](https://img.shields.io/badge/PHP-^8.1-787CB5?logo=php&logoColor=white)](https://php.net)
+[![Symfony Version](https://img.shields.io/badge/Symfony-^6.4%20%7C%20^7%20%7C%20^8-000000?logo=symfony&logoColor=white)](https://symfony.com)
+[![Unit Tests Coverage](https://img.shields.io/badge/Coverage-95.97%25-brightgreen)](https://github.com/recisio/symfony-nats-messenger/actions)
 [![Functional Tests](https://img.shields.io/badge/Functional%20Tests-Behat-blue)](tests/functional)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![CI](https://github.com/ideaconnect/symfony-nats-messenger/actions/workflows/ci.yml/badge.svg)](https://github.com/ideaconnect/symfony-nats-messenger/actions/workflows/ci.yml)
-![Made in the EU](https://raw.githubusercontent.com/ideaconnect/made-in-the-eu/main/software-badge/made-in-the-eu.svg)
+[![CI](https://github.com/recisio/symfony-nats-messenger/actions/workflows/ci.yml/badge.svg)](https://github.com/recisio/symfony-nats-messenger/actions/workflows/ci.yml)
 
 A Symfony Messenger transport integration for [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream), enabling reliable asynchronous messaging with persistent message streaming.
+
+This repository is a `recisio`-maintained fork intended to keep the transport usable on PHP 8.1 while remaining compatible with Symfony 6.4+.
 
 ## Features
 
@@ -21,23 +21,17 @@ A Symfony Messenger transport integration for [NATS JetStream](https://docs.nats
 - 📊 **Stream Configuration** - Configurable retention policies and replication
 - 🧪 **Thoroughly Tested** - 303 unit tests, ~99.6% coverage, mutation-tested (100% MSI)
 
-## 🚀 This project looks for funding. Love my work? Support it! 💖
-
-* ☕ **Buy me a coffee**: https://buymeacoffee.com/idct
-
-* 💝 **Sponsor**: https://github.com/sponsors/ideaconnect
-
 ## Requirements
 
 ### System Requirements
-- **PHP**: ^8.2
-- **Symfony**: ^7.2 || ^8
+- **PHP**: ^8.1
+- **Symfony**: ^6.4 || ^7 || ^8
 - **NATS Server**: ^2.9 with JetStream enabled, ^2.12 for scheduled messages support.
 
 ## Installation
 
 ```bash
-composer require idct/symfony-nats-messenger
+composer require recisio/symfony-nats-messenger
 ```
 
 ### Development Setup

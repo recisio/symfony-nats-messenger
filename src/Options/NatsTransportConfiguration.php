@@ -18,7 +18,7 @@ use IDCT\NatsMessenger\TypeCoercion;
  * @see NatsTransportConfigurationBuilder Builds instances of this class.
  * @see TransportOption                  Enum of all recognized option keys.
  */
-final readonly class NatsTransportConfiguration
+final class NatsTransportConfiguration
 {
     /**
      * @param string               $topic                   JetStream subject name

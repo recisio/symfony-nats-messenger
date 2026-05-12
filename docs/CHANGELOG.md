@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (recisio fork)
+- **PHP compatibility** — Lowered the minimum supported PHP version to 8.1 by replacing the PHP 8.2-only `readonly class` syntax with PHP 8.1-compatible readonly promoted properties.
+- **Symfony compatibility** — Expanded supported Symfony versions to include 6.4 for the package and the functional test application.
+- **Developer tooling** — Relaxed PHPUnit to `^10.5 || ^11` so the test suite can be installed on both PHP 8.1 and PHP 8.2+.
+- **Fork packaging** — Renamed the distributable package to `recisio/symfony-nats-messenger` and pointed dependencies at the `recisio/php-nats-jetstream-client` fork for public PHP 8.1-compatible distribution.
+
 ## [5.0.0] - 2026-06-17
 
 This is a **major** release. It is backward-incompatible for two reasons even though the transport's own
