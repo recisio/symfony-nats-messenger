@@ -16,7 +16,7 @@ use IDCT\NatsMessenger\TypeCoercionTrait;
  * @see NatsTransportConfigurationBuilder Builds instances of this class.
  * @see TransportOption                  Enum of all recognized option keys.
  */
-final readonly class NatsTransportConfiguration
+final class NatsTransportConfiguration
 {
     use TypeCoercionTrait;
 
@@ -29,12 +29,12 @@ final readonly class NatsTransportConfiguration
      * @param bool                 $scheduledMessagesEnabled True when delayed/scheduled message publishing is enabled
      */
     public function __construct(
-        public string $topic,
-        public string $streamName,
-        public NatsClient $client,
-        private array $options,
-        private bool $natsRetryHandlerEnabled,
-        private bool $scheduledMessagesEnabled = false,
+        public readonly string $topic,
+        public readonly string $streamName,
+        public readonly NatsClient $client,
+        private readonly array $options,
+        private readonly bool $natsRetryHandlerEnabled,
+        private readonly bool $scheduledMessagesEnabled = false,
     ) {
     }
 

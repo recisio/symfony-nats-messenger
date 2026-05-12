@@ -39,31 +39,31 @@ final class NatsTransportConfigurationBuilder
      * @var array<string, mixed>
      */
     private const DEFAULT_OPTIONS = [
-        TransportOption::CONSUMER->value => 'client',
-        TransportOption::BATCHING->value => 1,
-        TransportOption::MAX_BATCH_TIMEOUT->value => 1,
-        TransportOption::CONNECTION_TIMEOUT->value => 1,
-        TransportOption::STREAM_MAX_AGE->value => 0,
-        TransportOption::STREAM_MAX_BYTES->value => null,
-        TransportOption::STREAM_MAX_MESSAGES->value => null,
-        TransportOption::STREAM_MAX_MESSAGES_PER_SUBJECT->value => null,
-        TransportOption::STREAM_STORAGE->value => StorageBackend::File->value,
-        TransportOption::STREAM_REPLICAS->value => 1,
-        TransportOption::RETRY_HANDLER->value => RetryHandler::SYMFONY->value,
-        TransportOption::SCHEDULED_MESSAGES->value => false,
-        TransportOption::TLS_REQUIRED->value => false,
-        TransportOption::TLS_HANDSHAKE_FIRST->value => false,
-        TransportOption::TLS_CA_FILE->value => null,
-        TransportOption::TLS_CERT_FILE->value => null,
-        TransportOption::TLS_KEY_FILE->value => null,
-        TransportOption::TLS_KEY_PASSPHRASE->value => null,
-        TransportOption::TLS_PEER_NAME->value => null,
-        TransportOption::TLS_VERIFY_PEER->value => true,
-        TransportOption::TOKEN->value => null,
-        TransportOption::JWT->value => null,
-        TransportOption::NKEY->value => null,
-        TransportOption::USERNAME->value => null,
-        TransportOption::PASSWORD->value => null,
+        'consumer' => 'client',
+        'batching' => 1,
+        'max_batch_timeout' => 1,
+        'connection_timeout' => 1,
+        'stream_max_age' => 0,
+        'stream_max_bytes' => null,
+        'stream_max_messages' => null,
+        'stream_max_messages_per_subject' => null,
+        'stream_storage' => 'file',
+        'stream_replicas' => 1,
+        'retry_handler' => 'symfony',
+        'scheduled_messages' => false,
+        'tls_required' => false,
+        'tls_handshake_first' => false,
+        'tls_ca_file' => null,
+        'tls_cert_file' => null,
+        'tls_key_file' => null,
+        'tls_key_passphrase' => null,
+        'tls_peer_name' => null,
+        'tls_verify_peer' => true,
+        'token' => null,
+        'jwt' => null,
+        'nkey' => null,
+        'username' => null,
+        'password' => null,
     ];
 
     /**
@@ -73,7 +73,7 @@ final class NatsTransportConfigurationBuilder
      *
      * @param array<string, mixed> $options
      */
-    public function build(#[\SensitiveParameter] string $dsn, array $options = []): NatsTransportConfiguration
+    public function build(string $dsn, array $options = []): NatsTransportConfiguration
     {
         $components = $this->parseDsn($dsn);
         $configuration = $this->buildConfiguration($components, $options);

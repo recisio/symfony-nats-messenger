@@ -6,7 +6,7 @@ This directory contains functional tests using Behat that verify the NATS transp
 
 - Docker (for running NATS server)
 - Composer dependencies installed (`composer install`)
-- PHP 8.2+
+- PHP 8.1+
 
 ## Running the Tests
 

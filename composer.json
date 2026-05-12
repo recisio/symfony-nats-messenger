@@ -1,8 +1,13 @@
 {
-    "name": "idct/symfony-nats-messenger",
-    "description": "Symfony NATS (JetStream) Messenger Bridge",
+    "name": "recisio/symfony-nats-messenger",
+    "description": "Symfony NATS (JetStream) Messenger Bridge with PHP 8.1 compatibility",
     "type": "library",
     "license": "MIT",
+    "homepage": "https://github.com/recisio/symfony-nats-messenger",
+    "support": {
+        "issues": "https://github.com/recisio/symfony-nats-messenger/issues",
+        "source": "https://github.com/recisio/symfony-nats-messenger"
+    },
     "autoload": {
         "psr-4": {
             "IDCT\\NatsMessenger\\": "src/"
@@ -19,15 +24,18 @@
         "process-timeout": 600
     },
     "require": {
-        "php": "^8.2",
-        "symfony/framework-bundle": "^7 || ^8",
-        "symfony/messenger": "^7.2 || ^8.0",
-        "idct/php-nats-jetstream-client": "^1",
-        "symfony/uid": "^7.2 || ^8.0"
+        "php": "^8.1",
+        "symfony/framework-bundle": "^6.4 || ^7 || ^8",
+        "symfony/messenger": "^6.4 || ^7 || ^8",
+        "recisio/php-nats-jetstream-client": "^1",
+        "symfony/uid": "^6.4 || ^7 || ^8"
+    },
+    "replace": {
+        "idct/symfony-nats-messenger": "self.version"
     },
     "require-dev": {
         "behat/behat": "^3.29",
-        "phpunit/phpunit": "^11",
+        "phpunit/phpunit": "^10.5 || ^11",
         "phpstan/phpstan": "^2.1",
         "dg/bypass-finals": "^1.9"
     },
