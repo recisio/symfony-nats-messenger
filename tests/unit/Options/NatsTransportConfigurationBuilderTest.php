@@ -459,7 +459,9 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
     public function testDefaultOptionsCoversAllTransportOptionCases(): void
     {
         $reflection = new \ReflectionClass(NatsTransportConfigurationBuilder::class);
-        $defaultOptions = $reflection->getConstant('DEFAULT_OPTIONS');
+        $method = $reflection->getMethod('defaultOptions');
+        $method->setAccessible(true);
+        $defaultOptions = $method->invoke(null);
 
         $enumValues = array_map(static fn (TransportOption $case): string => $case->value, TransportOption::cases());
 
