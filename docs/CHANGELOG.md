@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (recisio fork)
+- **Stream retention policy** — new `retention` transport option (`limits` (default), `interest`, or `workqueue`) controlling the JetStream stream retention policy, mapping to the client `RetentionPolicy` enum. `workqueue`/`interest` let acknowledged messages be removed immediately (idiomatic way to avoid retaining successfully-processed messages). Like `stream_storage`, the policy is immutable on an existing stream: it is written only at stream creation and the server's value is preserved on update, so switching an existing stream requires recreating it.
+
 ### Changed (recisio fork)
 - **PHP compatibility** — Lowered the minimum supported PHP version to 8.1 by replacing the PHP 8.2-only `readonly class` syntax with PHP 8.1-compatible readonly promoted properties.
 - **Symfony compatibility** — Expanded supported Symfony versions to include 6.4 for the package and the functional test application.
