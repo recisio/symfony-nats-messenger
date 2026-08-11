@@ -1,7 +1,7 @@
 # Symfony NATS Messenger Bridge
 
-[![PHP Version](https://img.shields.io/badge/PHP-^8.2-787CB5?logo=php&logoColor=white)](https://php.net)
-[![Symfony Version](https://img.shields.io/badge/Symfony-^7.2%20%7C%20^8.0-000000?logo=symfony&logoColor=white)](https://symfony.com)
+[![PHP Version](https://img.shields.io/badge/PHP-^8.1-787CB5?logo=php&logoColor=white)](https://php.net)
+[![Symfony Version](https://img.shields.io/badge/Symfony-^6.4%20%7C%20^7%20%7C%20^8-000000?logo=symfony&logoColor=white)](https://symfony.com)
 [![Unit Tests Coverage](https://img.shields.io/badge/Coverage-99.58%25-brightgreen)](https://github.com/ideaconnect/symfony-nats-messenger/actions)
 [![Mutation MSI](https://img.shields.io/badge/Mutation%20MSI-100%25-brightgreen)](https://infection.github.io/)
 [![Functional Tests](https://img.shields.io/badge/Functional%20Tests-Behat-blue)](tests/functional)
@@ -11,10 +11,12 @@
 
 A Symfony Messenger transport integration for [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream), enabling reliable asynchronous messaging with persistent message streaming.
 
+This repository is a `recisio`-maintained fork intended to keep the package usable on PHP 8.1.
+
 ## Features
 
 - 🚀 **High-Performance Messaging** - Leverage NATS JetStream for fast, reliable message delivery
-- 📦 **Symfony Integration** - Implements Messenger's `TransportInterface`, `MessageCountAwareInterface`, `SetupableTransportInterface`, `KeepaliveReceiverInterface`, and `CloseableTransportInterface`
+- 📦 **Symfony Integration** - Implements Messenger's `TransportInterface`, `MessageCountAwareInterface`, and `SetupableTransportInterface`
 - ⚙️ **Configurable Consumers** - Support for multiple consumer strategies
 - 🔄 **Flexible Batching** - Adjustable message batch sizes and timeouts
 - 🔐 **Authentication Support** - Built-in support for NATS authentication
@@ -30,8 +32,8 @@ A Symfony Messenger transport integration for [NATS JetStream](https://docs.nats
 ## Requirements
 
 ### System Requirements
-- **PHP**: ^8.2
-- **Symfony**: ^7.2 || ^8
+- **PHP**: ^8.1
+- **Symfony**: ^6.4 || ^7 || ^8
 - **NATS Server**: ^2.9 with JetStream enabled, ^2.12 for scheduled messages support.
 
 ## Installation
@@ -914,7 +916,7 @@ The bridge consists of two main components:
 - Validates configuration
 
 ### NatsTransport
-- Implements Symfony's `TransportInterface`, `MessageCountAwareInterface`, `SetupableTransportInterface`, `KeepaliveReceiverInterface`, and `CloseableTransportInterface`
+- Implements Symfony's `TransportInterface`, `MessageCountAwareInterface`, and `SetupableTransportInterface`
 - Manages stream and consumer connections
 - Handles message serialization via a pluggable `SerializerInterface` (igbinary when constructed directly without one)
 - Supports batching and explicit acknowledgment

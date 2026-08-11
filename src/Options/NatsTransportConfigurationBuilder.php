@@ -39,55 +39,61 @@ final class NatsTransportConfigurationBuilder
      * Every recognized {@see TransportOption} must have an entry here. These defaults
      * are the lowest-priority layer in the merge: method options > DSN query > these defaults.
      *
-     * @var array<string, mixed>
+     * Implemented as a static method rather than a class constant because PHP 8.1 does not
+     * allow `EnumCase->value` inside constant expressions (supported from PHP 8.2 only).
+     *
+     * @return array<string, mixed>
      */
-    private const DEFAULT_OPTIONS = [
-        TransportOption::CONSUMER->value => 'client',
-        TransportOption::BATCHING->value => 1,
-        TransportOption::MAX_BATCH_TIMEOUT->value => 1,
-        TransportOption::CONNECTION_TIMEOUT->value => 1,
-        TransportOption::MAX_ACK_PENDING->value => null,
-        TransportOption::INACTIVE_THRESHOLD->value => null,
-        TransportOption::REPLAY_POLICY->value => null,
-        TransportOption::STREAM_MAX_AGE->value => 0,
-        TransportOption::STREAM_MAX_BYTES->value => null,
-        TransportOption::STREAM_MAX_MESSAGES->value => null,
-        TransportOption::STREAM_MAX_MESSAGES_PER_SUBJECT->value => null,
-        TransportOption::STREAM_MAX_MESSAGE_SIZE->value => null,
-        TransportOption::STREAM_MAX_CONSUMERS->value => null,
-        TransportOption::STREAM_STORAGE->value => StorageBackend::File->value,
-        TransportOption::STREAM_REPLICAS->value => null,
-        TransportOption::STREAM_RETENTION->value => null,
-        TransportOption::STREAM_DISCARD->value => null,
-        TransportOption::STREAM_DUPLICATE_WINDOW->value => null,
-        TransportOption::STREAM_COMPRESSION->value => null,
-        TransportOption::STREAM_DESCRIPTION->value => null,
-        TransportOption::STREAM_DENY_DELETE->value => null,
-        TransportOption::STREAM_DENY_PURGE->value => null,
-        TransportOption::STREAM_ALLOW_DIRECT->value => null,
-        TransportOption::STREAM_ALLOW_ROLLUP_HEADERS->value => null,
-        TransportOption::RETRY_HANDLER->value => RetryHandler::SYMFONY->value,
-        TransportOption::NAK_DELAY->value => 0,
-        TransportOption::ACK_WAIT->value => null,
-        TransportOption::MAX_DELIVER->value => null,
-        TransportOption::BACKOFF->value => null,
-        TransportOption::SCHEDULED_MESSAGES->value => false,
-        TransportOption::ACK_SYNC->value => false,
-        TransportOption::AUTO_SETUP->value => false,
-        TransportOption::TLS_REQUIRED->value => false,
-        TransportOption::TLS_HANDSHAKE_FIRST->value => false,
-        TransportOption::TLS_CA_FILE->value => null,
-        TransportOption::TLS_CERT_FILE->value => null,
-        TransportOption::TLS_KEY_FILE->value => null,
-        TransportOption::TLS_KEY_PASSPHRASE->value => null,
-        TransportOption::TLS_PEER_NAME->value => null,
-        TransportOption::TLS_VERIFY_PEER->value => true,
-        TransportOption::TOKEN->value => null,
-        TransportOption::JWT->value => null,
-        TransportOption::NKEY->value => null,
-        TransportOption::USERNAME->value => null,
-        TransportOption::PASSWORD->value => null,
-    ];
+    private static function defaultOptions(): array
+    {
+        return [
+            TransportOption::CONSUMER->value => 'client',
+            TransportOption::BATCHING->value => 1,
+            TransportOption::MAX_BATCH_TIMEOUT->value => 1,
+            TransportOption::CONNECTION_TIMEOUT->value => 1,
+            TransportOption::MAX_ACK_PENDING->value => null,
+            TransportOption::INACTIVE_THRESHOLD->value => null,
+            TransportOption::REPLAY_POLICY->value => null,
+            TransportOption::STREAM_MAX_AGE->value => 0,
+            TransportOption::STREAM_MAX_BYTES->value => null,
+            TransportOption::STREAM_MAX_MESSAGES->value => null,
+            TransportOption::STREAM_MAX_MESSAGES_PER_SUBJECT->value => null,
+            TransportOption::STREAM_MAX_MESSAGE_SIZE->value => null,
+            TransportOption::STREAM_MAX_CONSUMERS->value => null,
+            TransportOption::STREAM_STORAGE->value => StorageBackend::File->value,
+            TransportOption::STREAM_REPLICAS->value => null,
+            TransportOption::STREAM_RETENTION->value => null,
+            TransportOption::STREAM_DISCARD->value => null,
+            TransportOption::STREAM_DUPLICATE_WINDOW->value => null,
+            TransportOption::STREAM_COMPRESSION->value => null,
+            TransportOption::STREAM_DESCRIPTION->value => null,
+            TransportOption::STREAM_DENY_DELETE->value => null,
+            TransportOption::STREAM_DENY_PURGE->value => null,
+            TransportOption::STREAM_ALLOW_DIRECT->value => null,
+            TransportOption::STREAM_ALLOW_ROLLUP_HEADERS->value => null,
+            TransportOption::RETRY_HANDLER->value => RetryHandler::SYMFONY->value,
+            TransportOption::NAK_DELAY->value => 0,
+            TransportOption::ACK_WAIT->value => null,
+            TransportOption::MAX_DELIVER->value => null,
+            TransportOption::BACKOFF->value => null,
+            TransportOption::SCHEDULED_MESSAGES->value => false,
+            TransportOption::ACK_SYNC->value => false,
+            TransportOption::AUTO_SETUP->value => false,
+            TransportOption::TLS_REQUIRED->value => false,
+            TransportOption::TLS_HANDSHAKE_FIRST->value => false,
+            TransportOption::TLS_CA_FILE->value => null,
+            TransportOption::TLS_CERT_FILE->value => null,
+            TransportOption::TLS_KEY_FILE->value => null,
+            TransportOption::TLS_KEY_PASSPHRASE->value => null,
+            TransportOption::TLS_PEER_NAME->value => null,
+            TransportOption::TLS_VERIFY_PEER->value => true,
+            TransportOption::TOKEN->value => null,
+            TransportOption::JWT->value => null,
+            TransportOption::NKEY->value => null,
+            TransportOption::USERNAME->value => null,
+            TransportOption::PASSWORD->value => null,
+        ];
+    }
 
     /**
      * Builds an immutable transport configuration from a DSN and option overrides.
@@ -96,7 +102,7 @@ final class NatsTransportConfigurationBuilder
      *
      * @param array<string, mixed> $options
      */
-    public function build(#[\SensitiveParameter] string $dsn, array $options = []): NatsTransportConfiguration
+    public function build(string $dsn, array $options = []): NatsTransportConfiguration
     {
         $components = $this->parseDsn($dsn);
         $configuration = $this->buildConfiguration($components, $options);
@@ -220,7 +226,7 @@ final class NatsTransportConfigurationBuilder
     /**
      * Merges and validates final runtime options.
      *
-     * Merge precedence: $options (method params) > $query (DSN query string) > DEFAULT_OPTIONS.
+     * Merge precedence: $options (method params) > $query (DSN query string) > defaultOptions().
      * PHP's array union operator (+) keeps the first occurrence, so placing $options first
      * ensures method-level overrides win.
      *
@@ -237,7 +243,7 @@ final class NatsTransportConfigurationBuilder
         }
 
         /** @var array<string, mixed> $configuration */
-        $configuration = $options + $query + self::DEFAULT_OPTIONS;
+        $configuration = $options + $query + self::defaultOptions();
 
         $retryHandler = RetryHandler::tryFrom(TypeCoercion::stringValue($configuration[TransportOption::RETRY_HANDLER->value] ?? RetryHandler::SYMFONY->value));
         if ($retryHandler === null) {

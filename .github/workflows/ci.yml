@@ -9,11 +9,12 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 40  # Whole-job cap: install + analysis + unit/coverage + mutation (8.5) + functional + benchmark
+    timeout-minutes: 40  # Whole-job cap: install + analysis + unit/coverage + mutation (8.2) + functional + benchmark
 
     strategy:
       matrix:
-        php-version: [8.2, 8.5]
+        # Test 8.1 and 8.2 for now
+        php-version: [8.1, 8.2]
 
     steps:
     - name: Checkout code
@@ -78,7 +79,7 @@ jobs:
       run: composer coverage:check
 
     - name: Run mutation tests
-      if: matrix.php-version == '8.5'
+      if: matrix.php-version == '8.2'
       run: composer test:mutation
 
     - name: Install functional test dependencies
@@ -110,7 +111,7 @@ jobs:
 
     - name: Upload coverage reports
       uses: actions/upload-artifact@v7
-      if: matrix.php-version == '8.5'
+      if: matrix.php-version == '8.2'
       with:
         name: coverage-report
         path: |
@@ -120,7 +121,7 @@ jobs:
 
     - name: Upload benchmark results
       uses: actions/upload-artifact@v7
-      if: matrix.php-version == '8.5'
+      if: matrix.php-version == '8.2'
       with:
         name: benchmark-results
         path: tests/functional/benchmark-*.txt

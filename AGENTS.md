@@ -2,13 +2,13 @@
 
 ## Overview
 
-Symfony Messenger transport for NATS JetStream. PHP 8.2+, Symfony ^7.2 / ^8.0.
-Uses `idct/php-nats-jetstream-client` (amphp-based coroutines).
+Symfony Messenger transport for NATS JetStream. PHP 8.1+, Symfony ^6.4 / ^7 / ^8.
+Uses `recisio/php-nats-jetstream-client` (amphp-based coroutines).
 
 ## Installation
 
 ```bash
-composer require idct/symfony-nats-messenger
+composer require recisio/symfony-nats-messenger
 ```
 
 Development setup:

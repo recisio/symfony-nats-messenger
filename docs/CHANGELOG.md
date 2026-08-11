@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (recisio fork)
+- **Fork packaging** — Renamed the distributable package to `recisio/symfony-nats-messenger` (with a
+  Composer `replace` entry for `idct/symfony-nats-messenger`) for public distribution, and required the
+  `recisio/php-nats-jetstream-client` fork's `dev-main` instead of a tagged version, so there's no
+  separate version number to track on top of the upstream client's official releases. It has to be the
+  `recisio` fork, not `idct/php-nats-jetstream-client` directly: the upstream client's own `main` branch
+  requires PHP `^8.2`, which would defeat the point of this fork.
+- **PHP compatibility** — Lowered the minimum supported PHP version to 8.1: replaced the PHP 8.2-only
+  `readonly class NatsTransportConfiguration` with PHP 8.1-compatible per-property `readonly` promoted
+  properties, removed the PHP 8.2-only `#[\SensitiveParameter]` attribute from the DSN parameters it
+  annotated, and turned `NatsTransportConfigurationBuilder::DEFAULT_OPTIONS` from a class constant into a
+  `defaultOptions()` static method (PHP 8.1 doesn't allow enum-case `->value` access inside constant
+  expressions).
+- **Symfony compatibility** — Expanded supported Symfony versions to include 6.4 for the package and the
+  functional test application. `NatsTransport` no longer implements `KeepaliveReceiverInterface` or
+  `CloseableTransportInterface`, which don't exist before Symfony 7; the `keepalive()`/`close()` methods
+  are unchanged, just no longer interface-bound. The functional app's `property_info.yaml` and
+  `Console/Application.php` were adjusted to their Symfony 6.4-compatible equivalents
+  (`enabled: true`, `parent::add($command)`).
+- **Developer tooling** — Relaxed `phpunit/phpunit` to `^10.5 || ^11` and `infection/infection` to
+  `^0.29 || ^0.30 || ^0.31` so the test suite can be installed on both PHP 8.1 and PHP 8.2+.
+- **CI** — Matrix changed from `[8.2, 8.5]` to `[8.1, 8.2]` to test the newly supported floor; the
+  mutation-testing step and the coverage/benchmark artifact uploads (previously gated on PHP 8.5) now run
+  on PHP 8.2, the new highest tested version.
+
 ## [5.1.0] - 2026-08-09
 
 A **minor** release. It adds fifteen new DSN options and the `auto_setup` provisioning mode, and fixes
