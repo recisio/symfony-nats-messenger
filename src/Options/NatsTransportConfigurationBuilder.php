@@ -263,6 +263,8 @@ final class NatsTransportConfigurationBuilder
         $this->assertPositiveNumber($configuration, TransportOption::BATCHING, true);
         $this->assertPositiveNumber($configuration, TransportOption::MAX_BATCH_TIMEOUT);
         $this->assertPositiveNumber($configuration, TransportOption::CONNECTION_TIMEOUT);
+        // 0 is meaningful here: it turns the check off.
+        $this->assertNonNegativeNumber($configuration, TransportOption::PING_AFTER_IDLE);
         $this->assertNonNegativeNumber($configuration, TransportOption::STREAM_MAX_AGE, true);
         $this->assertNonNegativeNumber($configuration, TransportOption::STREAM_MAX_BYTES, true);
         $this->assertNonNegativeNumber($configuration, TransportOption::STREAM_MAX_MESSAGES, true);
