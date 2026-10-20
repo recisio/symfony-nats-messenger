@@ -32,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutation-testing step and the coverage/benchmark artifact uploads (previously gated on PHP 8.5) now run
   on PHP 8.2, the new highest tested version.
 
+### Added
+- **`ping_after_idle` option (seconds, default `30`; `0` turns it off) (#49).** An operation that finds
+  the connection unused for longer than this first checks it with one PING, answered within
+  `connection_timeout`, and runs on a new connection if the server does not answer. A server drops a
+  client that stops answering its pings, which a PHP process does whenever it is outside a transport call,
+  and load balancers and NAT gateways drop idle connections too, none of which the client notices until it
+  writes: without the check, the first message after a quiet period was the one that failed. The same
+  check follows an operation that failed on the connection other than with a JetStream reply: the client
+  can keep reporting a dead connection Open (clients before 2.10 after a failed write, 2.10 after the
+  server's fatal `-ERR`), which a re-dial waiting for Closed would never notice, and a connection that
+  silently stopped delivering only times out. `keepalive()` is never checked, since Symfony calls it from
+  a signal handler. `NatsTransportConfiguration` gains `pingAfterIdleSeconds()` and
+  `connectionTimeoutSeconds()`. Backported from upstream 8a8489f and 5b9f718.
+
 ### Fixed
 - **A lost connection is re-established by the next operation instead of failing every operation until
   the process restarts (#49).** The client runs with reconnect off, so once a connection is lost - the
