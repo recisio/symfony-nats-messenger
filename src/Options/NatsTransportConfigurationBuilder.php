@@ -51,6 +51,7 @@ final class NatsTransportConfigurationBuilder
             TransportOption::BATCHING->value => 1,
             TransportOption::MAX_BATCH_TIMEOUT->value => 1,
             TransportOption::CONNECTION_TIMEOUT->value => 1,
+            TransportOption::PING_AFTER_IDLE->value => 30,
             TransportOption::MAX_ACK_PENDING->value => null,
             TransportOption::INACTIVE_THRESHOLD->value => null,
             TransportOption::REPLAY_POLICY->value => null,
