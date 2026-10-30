@@ -8,13 +8,24 @@ on:
 
 jobs:
   test:
+    # Named after the PHP version and client only, so a matrix value such as phpunit-args does not change the
+    # name of the check.
+    name: test (${{ matrix.php-version }}, ${{ matrix.client }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40  # Whole-job cap: install + analysis + unit/coverage + mutation (8.2) + functional + benchmark
+    timeout-minutes: 40  # Whole-job cap: install + analysis + unit/coverage + mutation (8.5) + functional + benchmark
 
+    # The oldest PHP runs against the lowest client release the transport allows, the newest PHP against
+    # the latest client release, so CI tests the client versions users install (#52).
     strategy:
       matrix:
-        # Test 8.1 and 8.2 for now
-        php-version: [8.1, 8.2]
+        include:
+          - php-version: '8.2'
+            client: lowest
+          - php-version: '8.5'
+            client: latest
+            # PHPUnit 12 and later report a test double that sets no expectations as a PHPUnit notice, and a
+            # notice alone does not fail the run. PHPUnit 11, which PHP 8.2 installs, has no such option.
+            phpunit-args: --fail-on-phpunit-notice
 
     steps:
     - name: Checkout code
@@ -24,7 +35,7 @@ jobs:
       uses: shivammathur/setup-php@v2
       with:
         php-version: ${{ matrix.php-version }}
-        extensions: igbinary, json, mbstring
+        extensions: igbinary, json, mbstring, pcntl, posix
         coverage: xdebug
         tools: composer:v2
 
@@ -38,7 +49,7 @@ jobs:
     #   run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
 
     # - name: Cache dependencies
-    #   uses: actions/cache@v3
+    #   uses: actions/cache@v6
     #   with:
     #     path: ${{ steps.composer-cache.outputs.dir }}
     #     key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -46,6 +57,13 @@ jobs:
 
     - name: Install dependencies
       run: composer install --prefer-dist --no-progress
+
+    - name: Use the lowest client release the transport allows
+      if: matrix.client == 'lowest'
+      run: composer update idct/php-nats-jetstream-client --prefer-lowest --prefer-dist --no-progress
+
+    - name: Show the client release under test
+      run: composer show idct/php-nats-jetstream-client | grep -E '^versions'
 
     - name: Run static analysis and fast unit tests
       run: composer test
@@ -62,6 +80,10 @@ jobs:
         timeout 60 bash -c 'until nc -z localhost 4223; do sleep 2; done'
         echo "Waiting for NATS (mTLS) on port 4224..."
         timeout 60 bash -c 'until nc -z localhost 4224; do sleep 2; done'
+        echo "Waiting for NATS (drops idle clients) on port 4225..."
+        timeout 60 bash -c 'until nc -z localhost 4225; do sleep 2; done'
+        echo "Waiting for the NATS cluster of the examples on ports 4226-4228..."
+        timeout 60 bash -c 'until nc -z localhost 4226 && nc -z localhost 4227 && nc -z localhost 4228; do sleep 2; done'
         echo "All NATS servers are ready"
 
         # Verify monitoring endpoints
@@ -73,21 +95,66 @@ jobs:
         docker ps --filter "name=nats"
 
     - name: Run unit tests with coverage
-      run: composer test:unit
+      run: composer test:unit -- ${{ matrix.phpunit-args }}
 
     - name: Check coverage threshold (90%)
       run: composer coverage:check
 
+    # Mutants that change nothing must all escape. One that is detected shows that the mutant processes do
+    # not run the tests the way a plain run does, and the score of the run below would mean nothing.
+    - name: Check that mutant processes run the tests like a plain run
+      if: matrix.php-version == '8.5'
+      run: composer test:mutation:canary
+
     - name: Run mutation tests
-      if: matrix.php-version == '8.2'
+      if: matrix.php-version == '8.5'
       run: composer test:mutation
+
+    - name: Check that no mutant was killed by the test harness
+      if: matrix.php-version == '8.5'
+      run: composer test:mutation:check-log
+
+    # The console names no test that killed a mutant; infection.log holds the output of every mutant of the
+    # failed run, the canary's or the real one's.
+    - name: Upload Infection log on failure
+      if: failure() && matrix.php-version == '8.5'
+      uses: actions/upload-artifact@v7
+      with:
+        name: infection-log
+        path: infection.log
+        if-no-files-found: ignore
+        retention-days: 14
 
     - name: Install functional test dependencies
       run: composer test:functional:setup
 
+    - name: Use the lowest client release in the functional test app
+      if: matrix.client == 'lowest'
+      working-directory: tests/functional
+      run: composer update idct/php-nats-jetstream-client --prefer-lowest --prefer-dist --no-progress
+
+    # The functional test app installs the client on its own, so make sure it runs the release the unit tests
+    # above ran: otherwise the job would report the lowest release as tested while running another.
+    - name: Check the functional test app runs the client release under test
+      working-directory: tests/functional
+      run: |
+        APP=$(composer show idct/php-nats-jetstream-client | awk '/^versions/ {print $NF}')
+        ROOT=$(composer --working-dir=../.. show idct/php-nats-jetstream-client | awk '/^versions/ {print $NF}')
+        echo "functional test app: client $APP; unit tests: client $ROOT"
+        [ "$APP" = "$ROOT" ] || { echo "::error::The functional test app runs client $APP, the unit tests ran $ROOT"; exit 1; }
+
     - name: Run functional tests
       timeout-minutes: 25  # Behat suite runs the full matrix (plain/TLS/mTLS) incl. high-volume, large-message and scheduled scenarios
       run: composer test:functional
+
+    # Every examples/*.php must run and pass against the servers started above, the three-server cluster
+    # (nats_cluster_1 to 3) included; strict mode makes a skipped example fail the job too. Two examples stop
+    # or restart a test server with docker and start it again.
+    - name: Run examples
+      timeout-minutes: 5
+      run: composer examples
+      env:
+        EXAMPLES_STRICT: "1"
 
     - name: Run benchmark tests
       timeout-minutes: 5  # Set explicit timeout for benchmark tests
@@ -104,14 +171,18 @@ jobs:
         docker logs nats_test || echo "Could not get NATS plain logs"
         docker logs nats_test_tls || echo "Could not get NATS TLS logs"
         docker logs nats_test_mtls || echo "Could not get NATS mTLS logs"
+        docker logs nats_test_stale || echo "Could not get the logs of the NATS that drops idle clients"
+        for server in nats_cluster_1 nats_cluster_2 nats_cluster_3; do
+          docker logs --tail 200 "$server" || echo "Could not get the logs of $server"
+        done
         echo "=== Docker Containers ==="
         docker ps -a
         echo "=== Network Status ==="
-        netstat -tlnp | grep -E ':422[234]' || echo "NATS ports not listening"
+        netstat -tlnp | grep -E ':422[2-8]' || echo "NATS ports not listening"
 
     - name: Upload coverage reports
       uses: actions/upload-artifact@v7
-      if: matrix.php-version == '8.2'
+      if: matrix.php-version == '8.5'
       with:
         name: coverage-report
         path: |
@@ -121,7 +192,7 @@ jobs:
 
     - name: Upload benchmark results
       uses: actions/upload-artifact@v7
-      if: matrix.php-version == '8.2'
+      if: matrix.php-version == '8.5'
       with:
         name: benchmark-results
         path: tests/functional/benchmark-*.txt
@@ -155,7 +226,7 @@ jobs:
       uses: shivammathur/setup-php@v2
       with:
         php-version: 8.2
-        extensions: igbinary, json, mbstring
+        extensions: igbinary, json, mbstring, pcntl, posix
         coverage: none
         tools: composer:v2
 
@@ -174,6 +245,8 @@ jobs:
         timeout 60 bash -c 'until nc -z localhost 4222; do sleep 2; done'
         timeout 60 bash -c 'until nc -z localhost 4223; do sleep 2; done'
         timeout 60 bash -c 'until nc -z localhost 4224; do sleep 2; done'
+        timeout 60 bash -c 'until nc -z localhost 4225; do sleep 2; done'
+        timeout 60 bash -c 'until nc -z localhost 4226 && nc -z localhost 4227 && nc -z localhost 4228; do sleep 2; done'
         docker exec nats_test nats-server --version
 
     - name: Set up functional tests
@@ -183,16 +256,25 @@ jobs:
       working-directory: tests/functional
       run: ./vendor/bin/behat --no-colors --tags '~@delayed'
 
+    - name: Run examples against the oldest supported server
+      timeout-minutes: 5
+      run: composer examples
+      env:
+        EXAMPLES_STRICT: "1"
+
     # Belt and braces for the same hazard: if anything recreated the containers from the default
-    # image mid-run, the suite above proved nothing about the oldest supported server.
+    # image mid-run, the suite above proved nothing about the oldest supported server. The cluster the
+    # examples ran on is checked too.
     - name: Verify the suite really ran against the oldest supported server
       run: |
-        VERSION=$(docker exec nats_test nats-server --version)
-        echo "$VERSION"
-        echo "$VERSION" | grep -q ' v2\.10\.' || {
-          echo "::error::Expected a v2.10.x server, got: $VERSION"
-          exit 1
-        }
+        for server in nats_test nats_cluster_1 nats_cluster_2 nats_cluster_3; do
+          VERSION=$(docker exec "$server" nats-server --version)
+          echo "$server: $VERSION"
+          echo "$VERSION" | grep -q ' v2\.10\.' || {
+            echo "::error::Expected a v2.10.x server on $server, got: $VERSION"
+            exit 1
+          }
+        done
 
     - name: Stop NATS server
       if: always()

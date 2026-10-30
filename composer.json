@@ -1,7 +1,7 @@
 {
-    "name": "recisio/symfony-nats-messenger",
-    "description": "Symfony NATS (JetStream) Messenger Bridge with PHP 8.1 compatibility",
-    "type": "library",
+    "name": "idct/symfony-nats-messenger",
+    "description": "Symfony NATS (JetStream) Messenger Bridge",
+    "type": "symfony-bundle",
     "license": "MIT",
     "autoload": {
         "psr-4": {
@@ -21,27 +21,30 @@
             "infection/extension-installer": true
         }
     },
-    "replace": {
-        "idct/symfony-nats-messenger": "self.version"
-    },
     "require": {
-        "php": "^8.1",
-        "symfony/framework-bundle": "^6.4 || ^7 || ^8",
-        "symfony/messenger": "^6.4 || ^7 || ^8",
-        "recisio/php-nats-jetstream-client": "dev-main",
-        "symfony/uid": "^6.4 || ^7 || ^8"
+        "php": "^8.2",
+        "symfony/framework-bundle": "^7 || ^8",
+        "symfony/messenger": "^7.2 || ^8.0",
+        "idct/php-nats-jetstream-client": "^2.27.1",
+        "symfony/uid": "^7.2 || ^8.0",
+        "psr/log": "^3.0"
     },
     "require-dev": {
-        "behat/behat": "^3.29",
-        "phpunit/phpunit": "^10.5 || ^11",
-        "phpstan/phpstan": "^2.1",
-        "dg/bypass-finals": "^1.9",
-        "infection/infection": "^0.29 || ^0.30 || ^0.31"
+        "behat/behat": "^4.0",
+        "phpunit/phpunit": "^11.5 || ^12.5 || ^13.4",
+        "phpstan/phpstan": "^2.3",
+        "dg/bypass-finals": "^1.11",
+        "infection/infection": "^0.32 || ^0.33 || ^0.34 || ^0.35"
     },
     "scripts": {
         "analyse": "phpstan analyse --configuration phpstan.neon.dist",
-        "nats:start": "cd tests/nats && docker compose up -d",
+        "nats:certs": "bash tests/nats/certs/generate.sh",
+        "nats:start": [
+            "@nats:certs",
+            "cd tests/nats && docker compose up -d"
+        ],
         "nats:stop": "cd tests/nats && docker compose down -v",
+        "examples": "bash scripts/run-examples.sh",
         "test": [
             "@analyse",
             "@test:unit:fast"
@@ -52,7 +55,13 @@
         "test:functional:setup": "cd tests/functional && composer install --prefer-dist --no-progress",
         "test:unit": "XDEBUG_MODE=coverage ./vendor/bin/phpunit --configuration phpunit.xml.dist --coverage-clover clover.xml --coverage-text --colors=never --coverage-html coverage",
         "test:unit:fast": "./vendor/bin/phpunit --configuration phpunit.xml.dist",
-        "test:mutation": "XDEBUG_MODE=coverage ./vendor/bin/infection --threads=max --no-interaction"
+        "test:mutation": "XDEBUG_MODE=coverage ./vendor/bin/infection --threads=max --no-interaction --log-verbosity=all --show-mutations=max --logger-github=false",
+        "test:mutation:canary": [
+            "@php -r \"@unlink('.infection/noop-summary.json');\" --",
+            "XDEBUG_MODE=coverage ./vendor/bin/infection --noop --mutators=TrueValue,FalseValue --threads=max --no-interaction --min-msi=0 --min-covered-msi=0 --show-mutations=0 --log-verbosity=all --logger-github=false --logger-summary-json=.infection/noop-summary.json",
+            "@php scripts/check-mutation-canary.php"
+        ],
+        "test:mutation:check-log": "@php scripts/check-mutation-log.php"
     },
     "suggest": {
         "ext-igbinary": "For improved serialization performance when using the default IgbinarySerializer"

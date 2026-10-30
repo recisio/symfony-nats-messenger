@@ -44,6 +44,10 @@ vendor/bin/behat features/nats_setup.feature
 vendor/bin/behat --dry-run
 ```
 
+`behat.php` turns on strict result interpretation, so a scenario with an undefined or pending step fails the
+run. A dry run skips every step, so under strict interpretation it always exits 1: read its summary, where a
+step without a definition shows as "undefined" rather than "skipped".
+
 ## Performance Benchmark
 
 The functional test suite includes a comprehensive performance benchmark to measure throughput and memory usage:
@@ -126,7 +130,7 @@ scenario-to-test mapping, see [`docs/TESTS.md`](../../docs/TESTS.md) in the repo
 | `nats_batching.feature` | Batch consumption (various batch sizes) |
 | `nats_stream_limits.feature` | `max_bytes`, `max_msgs`, `max_msgs_per_subject` enforcement |
 | `nats_nak.feature` | `retry_handler: nats` (NAK redelivery) |
-| `nats_term.feature` | `retry_handler: symfony` (TERM, stop redelivery) |
+| `nats_term.feature` | `retry_handler: symfony` (TERM, stop redelivery), with the native PHP and the igbinary serializer |
 | `nats_delayed.feature` | Scheduled / delayed messages (`DelayStamp` → NATS schedule headers) |
 | `nats_tls.feature` | TLS connections |
 | `nats_mtls.feature` | mTLS with client certificates |
@@ -150,8 +154,8 @@ scenario-to-test mapping, see [`docs/TESTS.md`](../../docs/TESTS.md) in the repo
 
 ## Configuration Files
 
-### `behat.yml`
-Main Behat configuration file defining test contexts and formatters.
+### `behat.php`
+Main Behat configuration file defining test contexts and formatters. Behat 4 reads only PHP configuration.
 
 ### `features/nats_setup.feature`
 Gherkin feature file describing test scenarios in human-readable format.
@@ -172,8 +176,8 @@ NATS server configuration with authentication and JetStream enabled.
 # Run with maximum verbosity
 vendor/bin/behat -vvv
 
-# Show step definitions
-vendor/bin/behat --definitions
+# List the step definitions (use "i" instead of "l" to also see the method behind each)
+vendor/bin/behat --definitions l
 ```
 
 ### Manual Testing

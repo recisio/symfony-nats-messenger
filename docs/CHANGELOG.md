@@ -7,30 +7,485 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed (recisio fork)
-- **Fork packaging** — Renamed the distributable package to `recisio/symfony-nats-messenger` (with a
-  Composer `replace` entry for `idct/symfony-nats-messenger`) for public distribution, and required the
-  `recisio/php-nats-jetstream-client` fork's `dev-main` instead of a tagged version, so there's no
-  separate version number to track on top of the upstream client's official releases. It has to be the
-  `recisio` fork, not `idct/php-nats-jetstream-client` directly: the upstream client's own `main` branch
-  requires PHP `^8.2`, which would defeat the point of this fork.
-- **PHP compatibility** — Lowered the minimum supported PHP version to 8.1: replaced the PHP 8.2-only
-  `readonly class NatsTransportConfiguration` with PHP 8.1-compatible per-property `readonly` promoted
-  properties, removed the PHP 8.2-only `#[\SensitiveParameter]` attribute from the DSN parameters it
-  annotated, and turned `NatsTransportConfigurationBuilder::DEFAULT_OPTIONS` from a class constant into a
-  `defaultOptions()` static method (PHP 8.1 doesn't allow enum-case `->value` access inside constant
-  expressions).
-- **Symfony compatibility** — Expanded supported Symfony versions to include 6.4 for the package and the
-  functional test application. `NatsTransport` no longer implements `KeepaliveReceiverInterface` or
-  `CloseableTransportInterface`, which don't exist before Symfony 7; the `keepalive()`/`close()` methods
-  are unchanged, just no longer interface-bound. The functional app's `property_info.yaml` and
-  `Console/Application.php` were adjusted to their Symfony 6.4-compatible equivalents
-  (`enabled: true`, `parent::add($command)`).
-- **Developer tooling** — Relaxed `phpunit/phpunit` to `^10.5 || ^11` and `infection/infection` to
-  `^0.29 || ^0.30 || ^0.31` so the test suite can be installed on both PHP 8.1 and PHP 8.2+.
-- **CI** — Matrix changed from `[8.2, 8.5]` to `[8.1, 8.2]` to test the newly supported floor; the
-  mutation-testing step and the coverage/benchmark artifact uploads (previously gated on PHP 8.5) now run
-  on PHP 8.2, the new highest tested version.
+## [5.7.1] - 2026-10-19
+
+A **patch** release. It requires client 2.27.1, in which an acknowledgement whose write is the first to notice a
+lost connection no longer waits for the client's recovery when `reconnect` is on, and it adds three examples, for
+the reconnect mode, a failover in a three-server NATS cluster and stream placement, with the test cluster they
+run on. The README has a section on using a NATS cluster, a Logging section and an upgrade note. The transport's
+code and its public PHP API are unchanged.
+
+### Added
+- **Examples for the reconnect mode, cluster failover and stream placement, and a test cluster to run them on
+  (#84).** `composer nats:start` also runs a JetStream cluster `east` of three servers
+  (`tests/nats/nats-cluster*.conf`, ports 4226 to 4228, two servers tagged `disk:ssd` and one `disk:hdd`), and
+  `composer examples` runs three more examples, in CI on the latest and the oldest supported NATS as before:
+  `reconnect.php` restarts the test server under a worker with `reconnect: true` and `auto_setup`: the pull in
+  flight ends empty, no pull throws, and the memory stream the restart lost is recreated by the next send;
+  `cluster-failover.php` stops the server a worker is connected to, and the client fails over to a server it
+  learned from the cluster while the worker receives every message; `stream-placement.php` places replicas on
+  tagged servers, changes one half of a placement, and stages a move that comes with a replica change after
+  NATS refused it in one update. The two that take a server away do it with docker and start it again. Both
+  reconnect examples hand the transport a logger and print what the NATS client logged.
+
+### Changed
+- **Requires `idct/php-nats-jetstream-client` `^2.27.1` (was `^2.27`), so that with `reconnect: true` an
+  acknowledgement no longer waits for the client's recovery (client #244).** With client 2.27.0, an ACK, NAK or
+  TERM whose own write was the first to notice a lost connection, while the client still reported it open, ran
+  the client's recovery inline and retried the write, with no budget of its own: one `ack()` or `reject()` could
+  wait for a whole attempt loop, about 109 s at the client's defaults against a server that refuses connections.
+  Client 2.27.1 puts such a frame into the reconnect buffer and returns at once, as it already did for a frame
+  written while the recovery was under way, and the recovery sends it on the connection it makes; a recovery that
+  gives up discards it with the rest of the buffer and says so at error level, as the README describes. The
+  5.7.0 README and release notes pointed at the client issue as open. With the option off nothing changes: the
+  client runs with reconnect off and a failed write fails the acknowledgement as before. A new real-client test,
+  over a connection whose ACK write fails while the next dial is held 300 ms, has `ack()` and `reject()` return in
+  under 0.1 s and the frame reach the server on the recovered connection; on 2.27.0 both calls took 0.31 s.
+- **README:** an "Upgrading from 5.6" note (nothing to change; the two differences that apply in either mode), a
+  Logging section (what the NATS client logs at which level, how the bundle wires the application's `logger`, how to
+  wire one without the bundle), a note on a server that stops in the provisioning section, a troubleshooting entry
+  for "Reconnect attempts exhausted", and the logger and the two recovery modes in the architecture overview.
+- **README: a "Using a NATS Cluster" section, and the reconnect and placement options checked against the
+  README (#86).** The section covers how a process finds the servers (one in the DSN, the others learned from
+  it through `connect_urls`, `client_advertise`, and why the DSN should name more than one server for the first
+  dial), what each reconnect mode does when the server it is connected to stops, with figures measured on the
+  test cluster, replicas, placement, provisioning and leader changes on a cluster, and TLS on a cluster:
+  `tls_required: true` next to the `+tls` scheme, without which the client dials the servers it learned without
+  TLS, and the certificate name it checks. It points at the `cluster-failover.php` and `stream-placement.php`
+  examples. Elsewhere: the DSN form of `reconnect` and `max_reconnect_attempts`, that more than one replica
+  needs a cluster and that an existing stream keeps its replica count while `stream_replicas` is unset, a cluster
+  bullet in the features, and two troubleshooting entries.
+
+## [5.7.0] - 2026-10-17
+
+A **minor** release. It adds a reconnect mode: with `reconnect: true` the NATS client recovers a lost connection
+on its own and the transport leaves it to that, so a worker polls through an outage instead of exiting, and
+provisioning is verified again once the client reconnected. The NATS client logs through the application's
+logger, and a pull the server ended for its own shutdown or a leadership change is an empty batch rather than a
+missing consumer. With the option off, which is the default, the transport behaves as before.
+
+### Added
+- **`reconnect` and `max_reconnect_attempts` options: a mode in which the NATS client owns the recovery of a
+  lost connection (#45, #81).** Off by default, which is what the transport did before: the client runs with
+  reconnect off, the operation that runs into the lost connection fails, the next one dials again, a worker
+  exits and its supervisor restarts it. With `reconnect: true` the client re-dials in the background with its
+  backoff, up to `max_reconnect_attempts` times per recovery (default `null`, the client's own 10), replays
+  its subscriptions and flushes the frames it buffered, and the transport steps back. A client in the middle
+  of its recovery is left alone, with no PING and no dial of the transport's own, and the operation waits for
+  the recovery within its own budget: `request_timeout` for a request, `max_batch_timeout` plus a second for
+  a pull, which then ends empty. After a PING that failed, a client that is recovering or has already
+  recovered keeps its connection, a connection the client still reports open with no reconnect behind it is
+  replaced as without the option, and a client that gave up is Closed and dialled again, which runs the
+  client's attempt loop inside the operation and propagates its exception. With `auto_setup`, provisioning is
+  verified again once the client's reconnect count moved, since the client replaced the connection behind the
+  transport's back and the stream may have gone with the server; a send begun during the recovery that lands
+  on a server without the stream gets one `setup()` and one more publish of the same frame on the client's 503
+  "No JetStream responder". Measured with nats-server 2.14.2 over a 53 s `docker stop`: with the client's 10
+  attempts every operation waited within its budget and none dialled, with 2 attempts every operation after
+  the recovery gave up dialled inline for 18 s. Before this, the option as proposed in #45 ran the whole
+  attempt loop inside every operation during an outage, 109 s each at the defaults. The README's Automatic
+  Reconnect section has the table, the per-operation bounds and the two places the loop still runs inline.
+  Both options work from the DSN query string too. Two Behat scenarios restart the test server with docker
+  under a running worker and under a process that sends again after a quiet period.
+- **The NATS client logs through the application's logger (#81).** `NatsTransportFactory` takes an optional PSR-3
+  logger and hands it to every transport it creates, `NatsTransport` takes it as a fourth constructor argument,
+  and the bundle passes the application's `logger` service when there is one, under Messenger's Monolog
+  channel. The client writes its connection lifecycle at info level and its errors at error level; among them
+  `Reconnect exhausted: N bytes of buffered publishes were discarded`, the only trace of acknowledgements
+  written during an outage that a reconnect which gave up discarded (the messages come back after `ack_wait`).
+  Those went to a null logger before. `psr/log` `^3.0` is a direct requirement now; it was installed already,
+  through the client.
+
+### Fixed
+- **A pull the server ended for its shutdown or for a leadership change is an empty batch, not a missing
+  consumer (#81).** A server that is shutting down ends every pull in flight with `409 Server Shutdown`, and a
+  consumer whose leader moved ends them with `409 Leadership Change`. Every 409 used to read as a missing
+  consumer: with `auto_setup`, `setup()` ran against the server that was going away and failed, so a worker
+  exited with "Failed to setup NATS stream" on every graceful stop of its server, and without `auto_setup` the
+  409 propagated and ended the worker as well. Both read as an empty batch now, on the first pull and on the
+  one retried after re-provisioning, and after a shutdown the next operation checks the connection first, since
+  the server closes it right after. Only those two descriptions: `Consumer Deleted` is still a missing consumer,
+  and the 409s that report configuration (`Consumer is push based`, `Exceeded MaxRequestBatch`) still propagate.
+
+## [5.6.0] - 2026-10-17
+
+A **minor** release. It adds the `stream_placement_cluster` and `stream_placement_tags` options, which pin a
+stream to a JetStream cluster and to tagged servers. On an existing stream each option replaces only its own
+field of the live placement, and a tag list that names the live set in another order is left as the server
+stores it. A placement change combined with a `stream_replicas` change, which NATS refuses in one update, fails
+`setup()` with the steps to stage it. Nothing changes for a configuration that sets neither option.
+
+### Added
+- **Persistent project memory** in `docs/PROJECT_MEMORY.md`, linked from `AGENTS.md` and `CLAUDE.md`, covering the
+  maintainer's local client-library workflow, transport behavior, verification requirements, and
+  a dated GitHub issue and development-environment snapshot.
+- **`stream_placement_cluster` and `stream_placement_tags` options** exposing JetStream stream placement
+  (`placement.cluster` / `placement.tags`). Tags accept a YAML list or a comma-separated string, so they
+  work from a DSN query string as `stream_placement_tags=ssd,eu-west`. Both default to `null`, which
+  leaves the stream's placement untouched: on the update path the transport echoes the live server value
+  back, because a JetStream update that omits `placement` clears it (verified against nats-server 2.14).
+  On an existing stream each option replaces only its own field of the live block, so `stream_placement_tags`
+  alone keeps a cluster pin an operator set in NATS and `stream_placement_cluster` alone keeps the live
+  tags, and configured tags that name the live set in another order keep the live list as the server
+  stores it: nats-server reads any difference in the block, the order of the tags included, as a request
+  to move the stream's replicas, and refuses a move combined with a replica change. The tags are compared
+  exactly, since the server's `unique_tag` bypass is case-sensitive (#80).
+- **A placement change combined with a `stream_replicas` change on an existing stream fails with staging
+  advice.** nats-server refuses to move and scale a stream in one update (err_code 10123). `setup()` keeps
+  its `RuntimeException`, the server's wording and the client's `JetStreamException` as the previous
+  exception, and adds how to stage the two changes: apply one, wait until `nats stream info` shows every
+  replica as current, then apply the other. The update is not split by the transport, because with
+  `auto_setup` a `setup()` that applied one half would latch the done flag and never apply the other;
+  instead every `send()` and `get()` repeats the rejected update and fails until the configuration is
+  staged, and nothing is published or consumed meanwhile (#80).
+- **`TypeCoercion::stringListValue()` and `TypeCoercion::nonBlankStringValue()`** centralizing the
+  list-or-comma-separated-string coercion used by `stream_placement_tags` and the trimmed-name coercion used
+  by `stream_placement_cluster`. The builder validates with them and the configuration accessors read with
+  them, so a configuration constructed directly with raw values is read the way the builder would have
+  stored it.
+
+## [5.5.0] - 2026-10-16
+
+A **minor** release. It adds `IDCTNatsMessengerBundle`, which Symfony Flex enables and which registers the
+transport factory and the igbinary serializer, so `composer require` and a DSN are all an application needs. A
+pull refused at the connection's subscription limit now fails `get()` with a `TransportException` naming the
+limit, and the transport requires client 2.27. The development dependencies move to Behat 4 and PHPUnit 11 to 13.
+Applications that name the `igbinary_serializer` id should read "Upgrading from 5.4 or earlier" in the README.
+
+### Added
+- **`IDCTNatsMessengerBundle`** - a Symfony bundle that registers the transport factory and the
+  igbinary serializer automatically, each under its class name (for the serializer, the README's
+  `serializer:` value), so projects no longer need manual `services.yaml` entries to use the transport.
+  Flex enables it when the package is installed or updated, and going back to an earlier version leaves
+  it in `config/bundles.php`, to be deleted by hand (and added back by hand on a later update, since Flex
+  configures a package once). Existing entries keep working next to it. It does
+  not register the `igbinary_serializer` id earlier READMEs suggested, so a transport that names that id
+  needs the class name before its entry is deleted (README, "Upgrading from 5.4 or earlier").
+
+### Fixed
+- **A pull refused at the connection's subscription limit fails `get()` with a `TransportException` that names the
+  limit (#76).** The transport holds up to two subscriptions on a connection: the reply inbox of its requests, which
+  the first `send()`, `ack_sync` acknowledgement, `setup()` or `getMessageCount()` subscribes, and the reply inbox of
+  the pull in progress. With a per-connection limit of one (the server's `max_subscriptions`, or an account's or
+  user's `subs`), the server refuses the pull's inbox with `maximum subscriptions exceeded`, and every pull after the
+  first request on that connection fails. The client's `ConnectionException` left `get()` as it was, though Symfony's
+  `ReceiverInterface::get()` declares a `TransportException`, and when the client's heartbeat met the error first its
+  message ended "A retry subscribes a new one", which is wrong advice here. `get()` now throws a `TransportException`
+  naming the stream, the consumer and the limit, and saying the transport needs at least two subscriptions per
+  connection, with the client's `SubscriptionLimitException` as its previous exception. The second pull after
+  `auto_setup` provisioned the consumer again is covered too. Like any exception from `get()`, it ends a worker's
+  run; nothing is lost, and nothing hangs. The next operation still checks the connection first: the server sends the
+  same error when an account's limit is lowered below what the connection holds, and closes the connection about
+  20 ms later, so the error cannot prove the connection is still there. Other failures of a pull are unchanged.
+
+### Changed
+- **Requires `idct/php-nats-jetstream-client` `^2.27` instead of `^2.10.3`.** 2.27.0 reports the subscription limit
+  as `SubscriptionLimitException`, a `ConnectionException`, wherever it used to build a plain one for it, so the
+  transport recognises the limit by its type rather than by the error's wording (see Fixed). The functional test app
+  requires the same release.
+- **Tests for a pull at the subscription limit** (`tests/unit/SubscriptionLimitPullTest.php`), running the real client
+  over a scripted server (`tests/Support/SubscriptionLimitNatsServer.php`) that refuses a SUB beyond its limit, keeping
+  the connection open, and can send the limit error and close the connection 20 ms later, as nats-server does when an
+  account's limit is lowered. They cover a refusal the pull's own read meets and one the heartbeat's read meets,
+  delivery and acknowledgement at a limit of two, and the closing error before and after the pull's inbox was
+  confirmed, with the client still reporting the connection Open and with the client Closed. The transport's checks
+  are counted through `rtt()` (`tests/Support/RttCountingNatsClient.php`). `ClientInjectedNatsTransport` moved from
+  `tests/unit/UnansweredPullTest.php` to `tests/Support/`, so both files can use it.
+- **The unanswered-pull unit test tells the client's inbox fence from a connection check.** Client 2.19.0 writes a
+  PING behind each pull inbox's SUB in the same write, to learn whether the server took the subscription, and its
+  scripted server (`PullAnsweringServer` in `tests/unit/UnansweredPullTest.php`) counted that PING as a check the
+  transport made, failing `testOnlyAPullTheServerDidNotAnswerMakesTheNextOneCheckTheConnection` against that client.
+  The server still answers every PING but records only one written on its own. The test passes against client
+  2.10.3 and 2.19.0; the transport is unchanged.
+- **Development dependencies upgraded (#73, #74).** Behat 4.0 in the root and in the functional test app, PHPUnit
+  `^11.5 || ^12.5 || ^13.4` (PHP 8.2 installs 11, PHP 8.5 installs 13), Infection up to 0.35 (which needs PHP 8.3, so
+  PHP 8.2 keeps 0.32), PHPStan 2.3 and BypassFinals 1.11. The functional test app requires the newest Symfony 7.4 and
+  8.1 releases, Flex 2.11 and MakerBundle 1.68. Behat 4 reads neither YAML nor doc-comment annotations, so
+  `tests/functional/behat.yml` became `behat.php` (converted with `behat --convert-config`) and the context's step
+  definitions and hook became attributes (converted with Rector's Behat attribute set). Under PHPUnit 13 a test
+  double that sets no expectations is made with `createStub()` instead of `createMock()`, and `phpunit.xml.dist`
+  drops the deprecated `depends` execution order (PHPUnit resolves test dependencies by default). The
+  commented-out cache step in CI names `actions/cache@v6`; the other actions were already on their newest major
+  versions. The library's runtime requirements are unchanged.
+- **The functional suite fails on undefined and pending steps.** `tests/functional/behat.php` turns on strict result
+  interpretation. Behat 4 registers step definitions from attributes only, so a step left as a doc-comment annotation
+  is undefined, and a scenario using it was reported as undefined while the run, in CI and through
+  `composer test:functional`, exited 0. A dry run now always exits 1, since it skips every step, so `run_tests.sh`
+  leaves its exit code aside and the functional README says to read its summary. Guarded by
+  `FunctionalSuiteConfigTest`.
+- **`run_tests.sh` option 6 and the functional README list the step definitions with `--definitions l`.** Behat 4
+  requires a value for `--definitions`, so both printed "The "--definitions" option requires a value." and exited 1.
+- **PHPUnit deprecations, and on PHPUnit 13 PHPUnit notices, fail the unit suite.** `phpunit.xml.dist` sets
+  `failOnPhpunitDeprecation`, and CI's PHP 8.5 job runs the suite with `--fail-on-phpunit-notice`, the option for
+  the notice PHPUnit 12 and later give a test double that sets no expectations. Both used to be reported while the
+  run passed. PHPUnit 11, which PHP 8.2 installs, does not know `failOnPhpunitNotice` and rejects the whole file
+  when it sees it, so the notice option stays on the command line. Guarded by `UnitSuiteConfigTest`.
+- **The serialization-failure send test checks that nothing is published.** Its JetStream double became a stub
+  for PHPUnit 13, which silenced the notice but left the test unable to see a `send()` that publishes before
+  rethrowing the serializer's exception; it is a mock again, expecting `publish()` never to be called.
+
+## [5.4.1] - 2026-10-05
+
+A **patch** release. It fixes duplicate protection for transports that share a stream and the connection
+check around empty and unanswered pulls, leaves integer header names out of `decode()`, makes the mutation
+gate run the tests it scores, and requires client 2.10.3. Every `Nats-Msg-Id` changes with the upgrade (see
+Fixed).
+
+### Fixed
+- **With `deduplicate`, a message routed to two transports on one stream is stored for each.** Symfony hands
+  each transport a message is routed to the envelope the one before returned, deduplication id included, and
+  JetStream deduplicates per stream whatever the subject, so the second transport's copy was dropped, and
+  so were the failure-transport copies of a message that failed on two transports. The `Nats-Msg-Id` now
+  holds the transport's subject too (`<id>:<topic>:<retry count>`), and on a failure-transport copy the
+  transport the message failed on (`:failed:<receiver>`). Every id changes with the upgrade, so a message
+  sent once before it and again after it, within the stream's `duplicate_window`, is stored twice, and so
+  is one that processes still on 5.4.0 and processes already upgraded both send, as during a rolling deploy.
+- **An empty pull counts as using the connection.** It was counted only when messages came, so with
+  `max_batch_timeout` at or above `ping_after_idle` every pull after an empty one sent a PING first, with
+  one `connection_timeout` for the answer, and one slow answer dropped a healthy connection.
+- **A pull the server did not answer makes the next operation check the connection.** The client reports a
+  pull that got no answer before its own deadline, `max_batch_timeout` plus a second, as a JetStream error
+  with status 408, like the server's own end of a pull that found no messages, so it read as an empty
+  batch and called for no check. A half-open connection takes every write and delivers nothing: a consumer
+  on one pulled empty batches until the client's heartbeat noticed, about 90 seconds with its defaults. The
+  pull still reads as empty, and the next operation PINGs first, so the pull after it runs on a new
+  connection.
+- **A header whose name is a decimal integer is no longer passed to the serializer.** Any publisher can send
+  a header named `1` or `-5`, which the client returns as an int key, since PHP stores such array keys as
+  integers. `get()` handed it to the serializer's `decode()`, whose contract takes string names, so a
+  serializer relying on that under strict types failed with a `TypeError`: the message was rejected (TERMed
+  by default, NAKed and redelivered into the same failure with `retry_handler: nats`) and the worker
+  stopped. Symfony's serializers and this transport's ignore such a name and were not affected. No string
+  key can hold such a name, so `get()` now leaves those headers out. Client 2.10.3 declares the int keys,
+  which is how PHPStan found the call.
+- **The mutation gate counted every mutant as killed.** Infection runs each mutant in a PHPUnit process
+  whose bootstrap puts its include interceptor on `file://`. The interceptor registers itself again after
+  every file operation, which removed the wrapper BypassFinals puts on top of it, so in those processes the
+  client's final classes could not be doubled: every test that doubles one failed with
+  `ClassIsFinalException`, and Infection counted the mutant as killed whatever the tests checked. That error
+  accounted for 462 of the 857 kills, and a run whose mutants changed nothing at all scored 93%. The `minMsi`
+  90 and `minCoveredMsi` 95 floors passed whatever the tests caught, and the earlier MSI figures were not real:
+  the 100% in the README, in `docs/TESTS.md` and in older entries of this changelog, and the 5.4.0 release
+  notes' "mutation testing on the changed lines left no surviving mutant". `tests/bootstrap.php` now takes the
+  interceptor's file swap over in a mutant process, also when Infection runs from its PHAR, so mutants run
+  the tests as a plain run does. Measured with this fix, the real score was 96.3% (825 of 857): 50 mutants
+  that had counted as killed escaped, and the tests listed under Added kill them; `docs/TESTS.md` lists the
+  32 left, with the reason for each. The floors stay at 90 and 95. Two new checks, which CI runs around the
+  mutation run, keep it honest: `composer test:mutation:canary` fails when a mutant that changes nothing is
+  detected, and `composer test:mutation:check-log` fails when `infection.log` shows a mutant killed by the
+  harness rather than by a test (`composer test:mutation` now logs every mutant's output for it). When a
+  mutation step fails, CI uploads `infection.log`.
+- **Docs:** the README said the check after a failure catches a connection that silently stopped delivering,
+  which `get()` did not do until the fix above. It also gives the PING's real bound, `connection_timeout` or
+  the shorter `request_timeout`, for both checks. `CLAUDE.md`, `AGENTS.md` and `STRUCTURE.md` describe the
+  behaviour added since 5.2.0.
+
+### Added
+- **A unit test that runs the real client for the unanswered pull**, against an in-memory server, so a
+  client version that words its own pull deadline differently fails the suite instead of turning the check
+  off.
+- **Functional scenarios for the idle-connection check**, against a new test server that drops idle clients
+  within seconds (`nats-stale`, port 4225): a message sent after the server dropped the idle connection goes
+  out, and without the check it fails.
+- **A functional scenario for duplicate protection across two transports on one stream**, which fails on
+  5.4.0 with one message stored instead of two.
+- **Runnable examples** in `examples/`, one per behaviour: sending and consuming, duplicate protection, the
+  request timeout, keepalive from a signal handler, and the connection checks. Each prints `OK` when what it
+  shows held. `composer examples` runs them against the test server, and CI runs them after the functional
+  suite on the latest and the oldest supported NATS.
+- **Unit tests for configuration checks that no test covered.** A mutation run whose mutants really ran
+  the tests changed each of these without a test failing: the port in the DSN, an upper-case `+tls` scheme
+  or `stream_storage` value, timeouts below half a millisecond or set to `null`, the client's reconnect and
+  pedantic mode staying off, the `inactive_threshold` check, each tri-state stream flag after the first,
+  zero and fractional `backoff` entries, `max_deliver` without `backoff`, a `null` `stream_max_age` with a
+  duplicate window, and credential options given as numbers, booleans or arrays.
+- **Unit tests for configuration defaults and floors that no test covered**, found the same way: `ack_sync`
+  off when the configuration is built without it, the 1-second connection timeout and the 0 ms NAK delay
+  when the options are missing, negative `nak_delay` and `backoff` values read as 0 and a `backoff` entry of
+  0 kept as 0, and seconds converted to milliseconds rounding a fraction under half a millisecond down.
+- **Unit tests for transport behaviour that no test covered**, found the same way: the rest of a batch after
+  a message without a reply subject, a message without a `DelayStamp` on a transport with
+  `scheduled_messages`, a configured `stream_max_bytes` on an existing stream, subjects in the server's
+  config that are not non-empty strings, a connection last used exactly `ping_after_idle` ago, `auto_setup`
+  after a pull error that does not mean a missing consumer and after a 408 from the retried pull, a stream
+  state without a message count, the message for an unsupported feature while `scheduled_messages` is on,
+  and the previous exception of the errors `send()` and `setup()` throw. The test for a delay of under a
+  second no longer depends on the clock: it missed a change to the rounding in about one run in three.
+
+### Changed
+- **Requires `idct/php-nats-jetstream-client` `^2.10.3` instead of `^2.10`.** 2.10.3 declares the int keys of
+  a header name that is a decimal integer (see Fixed), and it no longer closes the connection on an `-ERR` the
+  server keeps the connection open for, such as `maximum subscriptions exceeded` for a subscription beyond an
+  account's or user's limit, as 2.10.1 and 2.10.2 did: the operation that read it fails, and the transport
+  goes on using the connection instead of dialling again. At the subscription limit, after the server has
+  rejected the reply inbox that requests share (the publish acknowledgement of `send()`, an ACK with
+  `ack_sync`, the JetStream API calls of `setup()` and `getMessageCount()`), a request fails at once without
+  being published, and once a slot is free requests work again on the same connection. 2.10.0 sent each later
+  request with a reply subject nobody held, so every one waited out `request_timeout`, even after a slot freed
+  up, and 2.10.1 and 2.10.2 dialled again for each and published it before the server rejected the new inbox,
+  so a `send()` that failed had stored its message. The first request on a new connection is still published
+  before its inbox is confirmed. Two narrow cases get worse than with 2.10.1 and 2.10.2, which closed the
+  connection at the `-ERR`. A pull whose own subscription the limit rejects still fails, but now on a
+  connection the transport keeps, so while the reply inbox holds the slot the pull needs every pull fails
+  until one frees up, where the next pull used to run on a new connection that had no reply inbox yet; a
+  `messenger:consume` worker stops at the first failed pull either way. And when the server closes the
+  connection right after `maximum subscriptions exceeded`, as it does when an account's limit is lowered, the
+  check after the failed operation still moves to a new connection, but with `ping_after_idle: 0`, or when the
+  client's heartbeat read the `-ERR`, operations go on to the closed connection until one fails, where they
+  used to run on a new one. An acknowledgement sent without waiting for a reply is lost there, and JetStream
+  redelivers the message after `ack_wait`; a `send()` or a pull fails, and a failed pull stops a
+  `messenger:consume` worker. The operation after the one that failed dials again. An `INFO` that is valid
+  JSON but not an object, which no real server sends, now fails the connect with
+  `INFO payload is not a JSON object` and is skipped once connected, where a number failed with a `TypeError`
+  and an array put default server info in place. The other fixes in 2.10.3 concern reconnects, connection and
+  error listeners, `drain()` and services, which the transport does not use: it runs the client with reconnect
+  off and closes it with `disconnect()`. One of them also covers the new `connect()` the transport makes when
+  it dials again, after a close that came while the reply inbox was being subscribed, but that went wrong only
+  when the subscription's write completed after the socket had closed, and the client's own transports fail
+  such a write.
+- **The functional suite's TLS certificates are generated, not committed (#9).** The repository held the
+  private keys of the test CA, server and client certificates, which security scanners report as a leaked
+  secret even though they were test-only. `tests/nats/certs/generate.sh` now creates the set with `openssl`
+  on each machine, `composer nats:start` (and the Behat context, when it starts NATS itself) runs it first,
+  and the files are ignored by git. The keys stay in the history, but nothing uses them any more. A set
+  that is about to expire is replaced as well, so that a long-lived checkout does not run the TLS
+  scenarios on expired certificates.
+
+## [5.4.0] - 2026-10-04
+
+A **minor** release. It adds duplicate protection, the `deduplicate` option and `DeduplicationIdStamp`
+(#53), and makes `getMessageCount()` give up after one connection attempt when NATS cannot be reached (#54).
+Nothing changes unless the new option or the new stamp is used.
+
+### Added
+- **Duplicate protection: the `deduplicate` option and `DeduplicationIdStamp` (#53).** A `send()` that timed
+  out may still have stored the message, so dispatching it again stored it twice, and so did Symfony when a
+  worker stopped after a retry or failure-transport send that timed out and NATS redelivered the original.
+  The transport now publishes the id of a `DeduplicationIdStamp` as `Nats-Msg-Id`, followed by Symfony's
+  retry count and a marker on the failure-transport copy, so JetStream drops a copy sent again within
+  `stream_duplicate_window` while each retry stays a message of its own. With `deduplicate: true` every
+  message gets an id on its first send, which travels with it; an application adds its own stamp to cover a
+  message it dispatches again as a new envelope. Off by default, so nothing changes unless it is set or a
+  stamp is added.
+
+### Fixed
+- **`getMessageCount()` against a server that cannot be reached tries to connect once, not twice (#54).**
+  When the consumer lookup failed, the stream-level fallback dialled again, so `messenger:stats` against a
+  server that was down waited 12 seconds for a refused connection and 18 seconds for one that did not
+  answer, with the default `connection_timeout`. It now gives up after the first attempt; a lookup that
+  failed on an open connection still falls back. It still returns 0 in that case, as documented: the
+  README now says that an outage reads as an empty queue there.
+
+## [5.3.0] - 2026-10-04
+
+A **minor** release. It adds the `request_timeout` option (#51), requires `idct/php-nats-jetstream-client`
+`^2.10` (#52), and corrects several places in the documentation (#55). Existing configurations behave as
+before: `request_timeout` defaults to the 10 seconds every request has waited until now.
+
+### Added
+- **`request_timeout` option (#51).** How long an operation waits for the server's reply was fixed at the
+  client's default of 10 seconds, and no option changed it: the publish acknowledgement of `send()`, an ACK
+  with `ack_sync`, and the JetStream API calls of `setup()` and `getMessageCount()` (`connection_timeout`
+  covers only the dial, and `max_batch_timeout` only the pull). `request_timeout` sets it, in seconds, from
+  the DSN query or the transport options. It defaults to 10, so nothing changes unless it is set.
+
+### Changed
+- **Requires `idct/php-nats-jetstream-client` `^2.10` instead of `^2.4` (#52).** The older releases still
+  passed the unit tests, but later ones fixed bugs on paths this transport uses: 2.5.2 the reconnect-disabled
+  path a dropped connection takes, 2.5.3 a publish acknowledgement with neither an error nor a stream that
+  was accepted as success, 2.9.0 one timeout for the whole request, and 2.10.0 a pull after an unnoticed
+  server restart, which now fails as a lost connection and leaves the client Closed, so the re-dial added
+  in 5.2.0 sees it at once. CI ran the functional suite against the client's unreleased `dev-main`; it now
+  runs it, with the unit tests, against the lowest client release allowed (on PHP 8.2) and the latest one
+  (on PHP 8.5).
+
+### Fixed
+- **Documentation corrections from the 5.1.0 review (#55).** `get()`'s docblock, a comment, `CLAUDE.md` and
+  `STRUCTURE.md` said that a missing consumer reads as an empty pull (status 404); a missing consumer
+  reports 503, which only `auto_setup` recovers from, and otherwise `get()` throws. `STRUCTURE.md` described
+  a `send()` path through `requestWithHeaders()` that no longer exists. The README said a lower
+  `connection_timeout` fails faster on any connection problem; a refused connection takes about 6 seconds
+  whatever the value, since a failing dial is tried three times. An old changelog entry said `close()` runs
+  on worker shutdown; Symfony never calls it. `send()`'s docblock now lists `ConnectionException` and
+  `TimeoutException`. Two stray fragments in the README were moved or removed.
+
+## [5.2.3] - 2026-10-03
+
+A **patch** release with a security fix: a `tls_verify_peer` value the transport does not recognize no
+longer turns TLS peer verification off (#42). The README now also says that Symfony's retry delays need
+`scheduled_messages` (#50). The public PHP API and the requirements are unchanged.
+
+### Fixed
+- **The README now says that Symfony's retry delays need `scheduled_messages: true` (#50).** Symfony's
+  retry strategy waits between attempts by re-sending the failed message with a `DelayStamp`, which the
+  transport applies only when `scheduled_messages` is enabled (NATS 2.12 or later). With the defaults every
+  retry ran straight after the failure, and only the scheduled-messages section of the README mentioned that
+  a `DelayStamp` is ignored. The retry section now says so too, and names the alternative for older servers:
+  `retry_handler: nats` with `nak_delay` or `backoff`, `max_deliver`, and `max_retries: 0`.
+
+### Security
+- **An unrecognized `tls_verify_peer` value no longer turns TLS peer verification off (#42).** It is the
+  only boolean option that defaults to `true`, but it went through the same coercion as the others, which
+  turns any value outside `1`, `true`, `yes` and `on` into `false`. So `tls_verify_peer=enabled`, `y`, an
+  empty value (`?tls_verify_peer=`, easy to get from an unset environment variable in a templated DSN) or a
+  `null` option made the transport connect over TLS without verifying the server's certificate, and said
+  nothing. Now only `false`, `0`, `no` or `off` turns verification off, and any other value keeps it on. A
+  transport configured with such a value whose server certificate cannot be verified now fails the TLS
+  handshake instead of connecting unverified; set `tls_verify_peer: false` if that is really intended.
+
+## [5.2.2] - 2026-10-03
+
+A **patch** release with one fix: `messenger:consume --keepalive` no longer stops the worker, or fails the
+message it is handling, at the first alarm (#48). The README has a new section on `--keepalive`. The public
+PHP API and the requirements are unchanged.
+
+### Fixed
+- **`messenger:consume --keepalive` no longer breaks the worker at the first alarm (#48).** Symfony calls
+  `keepalive()` from its `SIGALRM` signal handler, and `keepalive()` waited there for the in-progress
+  acknowledgement, which PHP does not allow inside a signal handler: it failed with "Cannot switch fibers in
+  current execution context". Depending on where the alarm caught the handler, the worker died, or the
+  message it was handling failed with that error and was retried. `keepalive()` now queues the
+  acknowledgement and returns without waiting. It goes out the next time the event loop runs: at once when
+  the handler waits on asynchronous work, such as a call to NATS, but only after the handler returns when it
+  only blocks, so such a handler needs an `ack_wait` longer than its longest run. Without a connection,
+  `keepalive()` now sends nothing instead of dialling, and a failed acknowledgement no longer surfaces from
+  it. The README has a new section on `--keepalive`.
+
+## [5.2.1] - 2026-10-03
+
+A **patch** release with two fixes to how a failed message is retried: the recommended `IgbinarySerializer`
+no longer stops the worker when Symfony retries a message or sends it to the failure transport (#46), and
+with `retry_handler: nats` Symfony's retry no longer multiplies the deliveries (#47). The public PHP API and
+the requirements are unchanged.
+
+### Fixed
+- **Retrying a failed message no longer crashes the worker when the transport uses `IgbinarySerializer`
+  (#46).** `AbstractEnveloperSerializer::encode()` serialized the whole envelope, including the stamps
+  Symfony marks as not to be sent (`NonSendableStampInterface`). One of them, the `AckStamp` a worker adds
+  to every message it handles, holds a closure, which igbinary cannot serialize, so every re-send of a
+  received message - Symfony's retry, and the send to a NATS failure transport - threw "Serialization of
+  'Closure' is not allowed". The exception stopped the worker before it rejected the message, JetStream
+  redelivered it after `ack_wait`, and the next worker failed the same way, running the handler again each
+  time. `encode()` now leaves those stamps out before serializing, as Symfony's own serializers do, for
+  every serializer extending `AbstractEnveloperSerializer`.
+- **With `retry_handler: nats`, Symfony's retry no longer multiplies the deliveries (#47).** Symfony's retry
+  listener runs for every transport with a retry strategy, and FrameworkBundle gives each one a strategy
+  (`max_retries: 3` by default). It re-sent a failed message as a copy while the transport NAKed the original
+  for NATS to redeliver, so each failure was retried twice, and every copy did the same again: one message
+  that kept failing ran its handler 120 times with `max_deliver: 3`. In nats mode the transport no longer
+  publishes that copy, so Symfony's retry strategy (`max_retries`, `delay`, `multiplier`) is ignored and
+  NATS redelivers alone, bounded by `max_deliver`. The README now explains how nats mode and Symfony's retry
+  and failure transport combine.
+
+## [5.2.0] - 2026-10-03
+
+A **minor** release. It fixes a transport instance that, once its connection was lost, failed every later
+operation until the process restarted (#49), and adds the `ping_after_idle` option that checks a connection
+which sat idle, or just failed an operation, before it is used. The public PHP API is additive only: a new
+`TransportOption::PING_AFTER_IDLE` case and the `pingAfterIdleSeconds()` and `connectionTimeoutSeconds()`
+accessors on `NatsTransportConfiguration`. Nothing released in 5.1.0 was renamed or removed, and the PHP
+(`^8.2`), Symfony (`^7.2 || ^8`) and `idct/php-nats-jetstream-client` (`^2.4`) requirements are
+unchanged; client 2.10.1, released alongside, fixes the client side of the same problem and is recommended.
 
 ### Added
 - **`ping_after_idle` option (seconds, default `30`; `0` turns it off) (#49).** An operation that finds
@@ -44,7 +499,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server's fatal `-ERR`), which a re-dial waiting for Closed would never notice, and a connection that
   silently stopped delivering only times out. `keepalive()` is never checked, since Symfony calls it from
   a signal handler. `NatsTransportConfiguration` gains `pingAfterIdleSeconds()` and
-  `connectionTimeoutSeconds()`. Backported from upstream 8a8489f and 5b9f718.
+  `connectionTimeoutSeconds()`.
 
 ### Fixed
 - **A lost connection is re-established by the next operation instead of failing every operation until
@@ -57,7 +512,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now dialled again by the next operation; the operation that ran into the lost connection still fails.
   With `auto_setup`, the new connection is verified in the same call that dials it rather than the next
   one, and a dial that fails surfaces as the client's `ConnectionException` instead of being wrapped as
-  "Failed to setup NATS stream", the first dial included. Backported from upstream 409f7f6.
+  "Failed to setup NATS stream", the first dial included.
 
 ## [5.1.0] - 2026-08-09
 
@@ -227,9 +682,9 @@ rejects fractional values, and DSN/option credentials are no longer trimmed. PHP
   block in the README (and pins their count), so a snippet that stops being valid PHP fails the build.
   This complements the existing tests that exercise the README's DSN, option, and serializer examples.
 - **`CloseableTransportInterface` support** - the transport now implements `close()`, which disconnects
-  the NATS client and resets the lazy connection state so resources are released on demand (e.g. on
-  worker shutdown). It is a no-op when no connection was opened, and the transport reconnects lazily on
-  the next operation.
+  the NATS client and resets the lazy connection state so resources are released on demand (when the
+  application calls it: Symfony itself never calls `close()`, not even on worker shutdown). It is a no-op
+  when no connection was opened, and the transport reconnects lazily on the next operation.
 - **`KeepaliveReceiverInterface` support** - the transport now implements Symfony Messenger's
   `keepalive()`, sending an in-progress (`+WPI`) acknowledgement so a long-running handler resets the
   JetStream redelivery timer instead of losing its message to `ack_wait` expiry. NATS resets to the

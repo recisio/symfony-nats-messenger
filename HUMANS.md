@@ -50,8 +50,9 @@ These exercise the transport against an actual NATS server in Docker:
 
 ```bash
 composer test:functional:setup   # one-time: install the test app's dependencies
-composer nats:start              # start NATS (plain + TLS + mTLS) in Docker
+composer nats:start              # generate the test TLS certs, then start NATS (plain + TLS + mTLS) in Docker
 composer test:functional         # run the Behat scenarios
+composer examples                # run the examples in examples/ against that NATS
 composer nats:stop               # tear NATS back down
 ```
 
@@ -60,6 +61,10 @@ composer nats:stop               # tear NATS back down
 ```bash
 composer require idct/symfony-nats-messenger
 ```
+
+Symfony Flex enables the shipped `IDCTNatsMessengerBundle` automatically (it registers the
+transport factory and the igbinary serializer for you); without Flex, add the bundle to
+`config/bundles.php` yourself. Then just configure a transport:
 
 ```yaml
 # config/packages/messenger.yaml
@@ -85,6 +90,7 @@ A quick tour (the full map is in [STRUCTURE.md](STRUCTURE.md)):
 
 - `src/NatsTransport.php` - the transport itself (send / receive / ack / reject / setup).
 - `src/NatsTransportFactory.php` - turns a DSN into a transport.
+- `src/IDCTNatsMessengerBundle.php` - registers the factory and serializer in Symfony apps.
 - `src/Options/` - how DSN + options become validated, immutable configuration.
 - `src/Serializer/` - how messages are encoded on the wire.
 - `tests/unit/` - fast tests, no server required.

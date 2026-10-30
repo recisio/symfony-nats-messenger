@@ -12,6 +12,7 @@ use IDCT\NATS\JetStream\Enum\RetentionPolicy;
 use IDCT\NATS\JetStream\Enum\StorageBackend;
 use IDCT\NatsMessenger\TypeCoercion;
 use InvalidArgumentException;
+use Psr\Log\LoggerInterface;
 
 /**
  * Parses a NATS JetStream DSN and merges transport options to produce an immutable
@@ -39,71 +40,76 @@ final class NatsTransportConfigurationBuilder
      * Every recognized {@see TransportOption} must have an entry here. These defaults
      * are the lowest-priority layer in the merge: method options > DSN query > these defaults.
      *
-     * Implemented as a static method rather than a class constant because PHP 8.1 does not
-     * allow `EnumCase->value` inside constant expressions (supported from PHP 8.2 only).
-     *
-     * @return array<string, mixed>
+     * @var array<string, mixed>
      */
-    private static function defaultOptions(): array
-    {
-        return [
-            TransportOption::CONSUMER->value => 'client',
-            TransportOption::BATCHING->value => 1,
-            TransportOption::MAX_BATCH_TIMEOUT->value => 1,
-            TransportOption::CONNECTION_TIMEOUT->value => 1,
-            TransportOption::PING_AFTER_IDLE->value => 30,
-            TransportOption::MAX_ACK_PENDING->value => null,
-            TransportOption::INACTIVE_THRESHOLD->value => null,
-            TransportOption::REPLAY_POLICY->value => null,
-            TransportOption::STREAM_MAX_AGE->value => 0,
-            TransportOption::STREAM_MAX_BYTES->value => null,
-            TransportOption::STREAM_MAX_MESSAGES->value => null,
-            TransportOption::STREAM_MAX_MESSAGES_PER_SUBJECT->value => null,
-            TransportOption::STREAM_MAX_MESSAGE_SIZE->value => null,
-            TransportOption::STREAM_MAX_CONSUMERS->value => null,
-            TransportOption::STREAM_STORAGE->value => StorageBackend::File->value,
-            TransportOption::STREAM_REPLICAS->value => null,
-            TransportOption::STREAM_RETENTION->value => null,
-            TransportOption::STREAM_DISCARD->value => null,
-            TransportOption::STREAM_DUPLICATE_WINDOW->value => null,
-            TransportOption::STREAM_COMPRESSION->value => null,
-            TransportOption::STREAM_DESCRIPTION->value => null,
-            TransportOption::STREAM_DENY_DELETE->value => null,
-            TransportOption::STREAM_DENY_PURGE->value => null,
-            TransportOption::STREAM_ALLOW_DIRECT->value => null,
-            TransportOption::STREAM_ALLOW_ROLLUP_HEADERS->value => null,
-            TransportOption::RETRY_HANDLER->value => RetryHandler::SYMFONY->value,
-            TransportOption::NAK_DELAY->value => 0,
-            TransportOption::ACK_WAIT->value => null,
-            TransportOption::MAX_DELIVER->value => null,
-            TransportOption::BACKOFF->value => null,
-            TransportOption::SCHEDULED_MESSAGES->value => false,
-            TransportOption::ACK_SYNC->value => false,
-            TransportOption::AUTO_SETUP->value => false,
-            TransportOption::TLS_REQUIRED->value => false,
-            TransportOption::TLS_HANDSHAKE_FIRST->value => false,
-            TransportOption::TLS_CA_FILE->value => null,
-            TransportOption::TLS_CERT_FILE->value => null,
-            TransportOption::TLS_KEY_FILE->value => null,
-            TransportOption::TLS_KEY_PASSPHRASE->value => null,
-            TransportOption::TLS_PEER_NAME->value => null,
-            TransportOption::TLS_VERIFY_PEER->value => true,
-            TransportOption::TOKEN->value => null,
-            TransportOption::JWT->value => null,
-            TransportOption::NKEY->value => null,
-            TransportOption::USERNAME->value => null,
-            TransportOption::PASSWORD->value => null,
-        ];
-    }
+    private const DEFAULT_OPTIONS = [
+        TransportOption::CONSUMER->value => 'client',
+        TransportOption::BATCHING->value => 1,
+        TransportOption::MAX_BATCH_TIMEOUT->value => 1,
+        TransportOption::CONNECTION_TIMEOUT->value => 1,
+        TransportOption::PING_AFTER_IDLE->value => 30,
+        // The client's own default, so a transport that does not set it behaves as before the option existed.
+        TransportOption::REQUEST_TIMEOUT->value => 10,
+        TransportOption::RECONNECT->value => false,
+        TransportOption::MAX_RECONNECT_ATTEMPTS->value => null,
+        TransportOption::MAX_ACK_PENDING->value => null,
+        TransportOption::INACTIVE_THRESHOLD->value => null,
+        TransportOption::REPLAY_POLICY->value => null,
+        TransportOption::STREAM_MAX_AGE->value => 0,
+        TransportOption::STREAM_MAX_BYTES->value => null,
+        TransportOption::STREAM_MAX_MESSAGES->value => null,
+        TransportOption::STREAM_MAX_MESSAGES_PER_SUBJECT->value => null,
+        TransportOption::STREAM_MAX_MESSAGE_SIZE->value => null,
+        TransportOption::STREAM_MAX_CONSUMERS->value => null,
+        TransportOption::STREAM_STORAGE->value => StorageBackend::File->value,
+        TransportOption::STREAM_REPLICAS->value => null,
+        TransportOption::STREAM_RETENTION->value => null,
+        TransportOption::STREAM_DISCARD->value => null,
+        TransportOption::STREAM_DUPLICATE_WINDOW->value => null,
+        TransportOption::STREAM_COMPRESSION->value => null,
+        TransportOption::STREAM_DESCRIPTION->value => null,
+        TransportOption::STREAM_DENY_DELETE->value => null,
+        TransportOption::STREAM_DENY_PURGE->value => null,
+        TransportOption::STREAM_ALLOW_DIRECT->value => null,
+        TransportOption::STREAM_ALLOW_ROLLUP_HEADERS->value => null,
+        TransportOption::STREAM_PLACEMENT_CLUSTER->value => null,
+        TransportOption::STREAM_PLACEMENT_TAGS->value => null,
+        TransportOption::RETRY_HANDLER->value => RetryHandler::SYMFONY->value,
+        TransportOption::NAK_DELAY->value => 0,
+        TransportOption::ACK_WAIT->value => null,
+        TransportOption::MAX_DELIVER->value => null,
+        TransportOption::BACKOFF->value => null,
+        TransportOption::SCHEDULED_MESSAGES->value => false,
+        TransportOption::ACK_SYNC->value => false,
+        TransportOption::DEDUPLICATE->value => false,
+        TransportOption::AUTO_SETUP->value => false,
+        TransportOption::TLS_REQUIRED->value => false,
+        TransportOption::TLS_HANDSHAKE_FIRST->value => false,
+        TransportOption::TLS_CA_FILE->value => null,
+        TransportOption::TLS_CERT_FILE->value => null,
+        TransportOption::TLS_KEY_FILE->value => null,
+        TransportOption::TLS_KEY_PASSPHRASE->value => null,
+        TransportOption::TLS_PEER_NAME->value => null,
+        TransportOption::TLS_VERIFY_PEER->value => true,
+        TransportOption::TOKEN->value => null,
+        TransportOption::JWT->value => null,
+        TransportOption::NKEY->value => null,
+        TransportOption::USERNAME->value => null,
+        TransportOption::PASSWORD->value => null,
+    ];
 
     /**
      * Builds an immutable transport configuration from a DSN and option overrides.
      *
      * Option precedence is: method options > DSN query params > defaults.
      *
+     * The logger, when given, is the client's: it writes the connection's lifecycle at info level and its errors at
+     * error level, among them the report of acknowledgements buffered during an outage that a reconnect which gave
+     * up discarded. Without one those go nowhere.
+     *
      * @param array<string, mixed> $options
      */
-    public function build(string $dsn, array $options = []): NatsTransportConfiguration
+    public function build(#[\SensitiveParameter] string $dsn, array $options = [], ?LoggerInterface $logger = null): NatsTransportConfiguration
     {
         $components = $this->parseDsn($dsn);
         $configuration = $this->buildConfiguration($components, $options);
@@ -115,11 +121,22 @@ final class NatsTransportConfigurationBuilder
         $port = TypeCoercion::intValue($components['port'] ?? self::DEFAULT_NATS_PORT, self::DEFAULT_NATS_PORT);
         $server = sprintf('%s://%s:%d', $scheme, $host, $port);
 
+        // max_reconnect_attempts is forwarded only when configured so that the client's own default
+        // applies otherwise; repeating that default here would silently diverge from the client over time.
+        $reconnectArguments = ['reconnectEnabled' => $this->toBool($configuration[TransportOption::RECONNECT->value])];
+        $maxReconnectAttempts = $configuration[TransportOption::MAX_RECONNECT_ATTEMPTS->value] ?? null;
+        if ($maxReconnectAttempts !== null) {
+            $reconnectArguments['maxReconnectAttempts'] = TypeCoercion::intValue($maxReconnectAttempts);
+        }
+
         $client = new NatsClient(new NatsOptions(
+            ...$reconnectArguments,
             servers: [$server],
             connectTimeoutMs: max(1, TypeCoercion::secondsToMs($configuration[TransportOption::CONNECTION_TIMEOUT->value] ?? null, 1.0)),
+            // How long a request waits for the server's reply: the publish acknowledgement of send(), an
+            // ack_sync ACK, and the JetStream API calls of setup() and getMessageCount().
+            requestTimeoutMs: max(1, TypeCoercion::secondsToMs($configuration[TransportOption::REQUEST_TIMEOUT->value] ?? null, 10.0)),
             pedantic: false,
-            reconnectEnabled: false,
             tlsRequired: $this->toBool($configuration[TransportOption::TLS_REQUIRED->value]),
             tlsHandshakeFirst: $this->toBool($configuration[TransportOption::TLS_HANDSHAKE_FIRST->value]),
             tlsCaFile: $this->toNullableString($configuration[TransportOption::TLS_CA_FILE->value]),
@@ -127,12 +144,16 @@ final class NatsTransportConfigurationBuilder
             tlsKeyFile: $this->toNullableString($configuration[TransportOption::TLS_KEY_FILE->value]),
             tlsKeyPassphrase: $this->toNullableString($configuration[TransportOption::TLS_KEY_PASSPHRASE->value]),
             tlsPeerName: $this->toNullableString($configuration[TransportOption::TLS_PEER_NAME->value]),
-            tlsVerifyPeer: $this->toBool($configuration[TransportOption::TLS_VERIFY_PEER->value]),
+            // Unlike the other boolean options, this one defaults to true, so a value the coercion does not
+            // recognize has to keep it on: only false, 0, no or off turns peer verification off. Any other
+            // value, an empty one included, used to turn it off without a word (#42).
+            tlsVerifyPeer: TypeCoercion::boolValue($configuration[TransportOption::TLS_VERIFY_PEER->value], true),
             token: $this->toNullableString($configuration[TransportOption::TOKEN->value]),
             username: $this->resolveCredential($components, $configuration, TransportOption::USERNAME, 'user'),
             password: $this->resolveCredential($components, $configuration, TransportOption::PASSWORD, 'pass'),
             jwt: $this->toNullableString($configuration[TransportOption::JWT->value]),
             nkey: $this->toNullableString($configuration[TransportOption::NKEY->value]),
+            logger: $logger,
         ));
 
         return new NatsTransportConfiguration(
@@ -143,6 +164,7 @@ final class NatsTransportConfigurationBuilder
             natsRetryHandlerEnabled: $configuration[TransportOption::RETRY_HANDLER->value] === RetryHandler::NATS->value,
             scheduledMessagesEnabled: $this->toBool($configuration[TransportOption::SCHEDULED_MESSAGES->value]),
             ackSyncEnabled: $this->toBool($configuration[TransportOption::ACK_SYNC->value]),
+            deduplicationEnabled: $this->toBool($configuration[TransportOption::DEDUPLICATE->value]),
             autoSetupEnabled: $this->toBool($configuration[TransportOption::AUTO_SETUP->value]),
         );
     }
@@ -227,7 +249,7 @@ final class NatsTransportConfigurationBuilder
     /**
      * Merges and validates final runtime options.
      *
-     * Merge precedence: $options (method params) > $query (DSN query string) > defaultOptions().
+     * Merge precedence: $options (method params) > $query (DSN query string) > DEFAULT_OPTIONS.
      * PHP's array union operator (+) keeps the first occurrence, so placing $options first
      * ensures method-level overrides win.
      *
@@ -244,7 +266,7 @@ final class NatsTransportConfigurationBuilder
         }
 
         /** @var array<string, mixed> $configuration */
-        $configuration = $options + $query + self::defaultOptions();
+        $configuration = $options + $query + self::DEFAULT_OPTIONS;
 
         $retryHandler = RetryHandler::tryFrom(TypeCoercion::stringValue($configuration[TransportOption::RETRY_HANDLER->value] ?? RetryHandler::SYMFONY->value));
         if ($retryHandler === null) {
@@ -264,8 +286,11 @@ final class NatsTransportConfigurationBuilder
         $this->assertPositiveNumber($configuration, TransportOption::BATCHING, true);
         $this->assertPositiveNumber($configuration, TransportOption::MAX_BATCH_TIMEOUT);
         $this->assertPositiveNumber($configuration, TransportOption::CONNECTION_TIMEOUT);
+        $this->assertPositiveNumber($configuration, TransportOption::REQUEST_TIMEOUT);
         // 0 is meaningful here: it turns the check off.
         $this->assertNonNegativeNumber($configuration, TransportOption::PING_AFTER_IDLE);
+        // null defers to the client's default; 0 would only spell "reconnect disabled" a second way.
+        $this->assertPositiveNumber($configuration, TransportOption::MAX_RECONNECT_ATTEMPTS, true);
         $this->assertNonNegativeNumber($configuration, TransportOption::STREAM_MAX_AGE, true);
         $this->assertNonNegativeNumber($configuration, TransportOption::STREAM_MAX_BYTES, true);
         $this->assertNonNegativeNumber($configuration, TransportOption::STREAM_MAX_MESSAGES, true);
@@ -285,6 +310,7 @@ final class NatsTransportConfigurationBuilder
         $this->assertNotExceedingInt32($configuration, TransportOption::STREAM_MAX_MESSAGE_SIZE);
         $this->assertStreamDescriptionLength($configuration);
         $this->assertTriStateBooleans($configuration);
+        $this->normalizeStreamPlacement($configuration);
         $this->assertNonNegativeNumber($configuration, TransportOption::NAK_DELAY);
         $this->assertPositiveNumber($configuration, TransportOption::ACK_WAIT);
         $this->assertPositiveNumber($configuration, TransportOption::MAX_DELIVER, true);
@@ -511,6 +537,58 @@ final class NatsTransportConfigurationBuilder
                 strlen($description),
             ));
         }
+    }
+
+    /**
+     * Validates and normalizes the two stream placement options.
+     *
+     * `stream_placement_cluster` must be a non-empty string when set. `stream_placement_tags` accepts a
+     * list of non-empty strings (a YAML list, or `stream_placement_tags[]=a&stream_placement_tags[]=b`
+     * in a DSN query string) or a single comma-separated string (`stream_placement_tags=a,b`); it is
+     * stored back as the normalized list so every reader of the option sees one shape. Both default to
+     * null, which leaves the stream's placement untouched.
+     *
+     * The normalization is {@see TypeCoercion::nonBlankStringValue()} and
+     * {@see TypeCoercion::stringListValue()}, which the {@see NatsTransportConfiguration} accessors
+     * apply as well: the configuration can be constructed directly with raw values, so the two sides
+     * share the rules instead of each spelling out their own.
+     *
+     * @param array<string, mixed> $configuration Merged configuration array
+     */
+    private function normalizeStreamPlacement(array &$configuration): void
+    {
+        $cluster = $configuration[TransportOption::STREAM_PLACEMENT_CLUSTER->value] ?? null;
+        if ($cluster !== null) {
+            $normalizedCluster = TypeCoercion::nonBlankStringValue($cluster);
+            if ($normalizedCluster === null) {
+                throw new InvalidArgumentException(sprintf(
+                    'The %s option must be a non-empty string.',
+                    TransportOption::STREAM_PLACEMENT_CLUSTER->value,
+                ));
+            }
+
+            $configuration[TransportOption::STREAM_PLACEMENT_CLUSTER->value] = $normalizedCluster;
+        }
+
+        $tags = $configuration[TransportOption::STREAM_PLACEMENT_TAGS->value] ?? null;
+        if ($tags === null) {
+            return;
+        }
+
+        // Reject loudly rather than silently dropping a malformed element: a tag that is quietly
+        // ignored would place the stream somewhere other than where the operator asked. A value that is
+        // neither a list nor a string or integer needs no check here: stringListValue() yields [] for it.
+        $elementsAreScalar = !is_array($tags)
+            || count(array_filter($tags, static fn (mixed $tag): bool => is_string($tag) || is_int($tag))) === count($tags);
+        $normalizedTags = $elementsAreScalar ? TypeCoercion::stringListValue($tags) : [];
+        if ($normalizedTags === []) {
+            throw new InvalidArgumentException(sprintf(
+                'The %s option must be a non-empty list of non-empty strings, or a comma-separated string of them.',
+                TransportOption::STREAM_PLACEMENT_TAGS->value,
+            ));
+        }
+
+        $configuration[TransportOption::STREAM_PLACEMENT_TAGS->value] = $normalizedTags;
     }
 
     /**

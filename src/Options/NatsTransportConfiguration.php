@@ -21,7 +21,7 @@ use IDCT\NatsMessenger\TypeCoercion;
  * @see NatsTransportConfigurationBuilder Builds instances of this class.
  * @see TransportOption                  Enum of all recognized option keys.
  */
-final class NatsTransportConfiguration
+final readonly class NatsTransportConfiguration
 {
     /**
      * @param string               $topic                   JetStream subject name
@@ -32,16 +32,18 @@ final class NatsTransportConfiguration
      * @param bool                 $scheduledMessagesEnabled True when delayed/scheduled message publishing is enabled
      * @param bool                 $ackSyncEnabled          True when acknowledgements should wait for server confirmation (double-ack)
      * @param bool                 $autoSetupEnabled        True when the transport should provision the stream/consumer on first use
+     * @param bool                 $deduplicationEnabled    True when every published message gets an id JetStream deduplicates it by
      */
     public function __construct(
-        public readonly string $topic,
-        public readonly string $streamName,
-        public readonly NatsClient $client,
-        private readonly array $options,
-        private readonly bool $natsRetryHandlerEnabled,
-        private readonly bool $scheduledMessagesEnabled = false,
-        private readonly bool $ackSyncEnabled = false,
-        private readonly bool $autoSetupEnabled = false,
+        public string $topic,
+        public string $streamName,
+        public NatsClient $client,
+        private array $options,
+        private bool $natsRetryHandlerEnabled,
+        private bool $scheduledMessagesEnabled = false,
+        private bool $ackSyncEnabled = false,
+        private bool $autoSetupEnabled = false,
+        private bool $deduplicationEnabled = false,
     ) {
     }
 
@@ -101,6 +103,25 @@ final class NatsTransportConfiguration
     public function pingAfterIdleSeconds(): float
     {
         return max(0.0, TypeCoercion::floatValue($this->options[TransportOption::PING_AFTER_IDLE->value] ?? null, 30.0));
+    }
+
+    /**
+     * Returns whether the NATS client re-dials on its own after the connection drops (default: false).
+     *
+     * The flag is applied to the client by {@see NatsTransportConfigurationBuilder}; this accessor
+     * only reports the configured value.
+     */
+    public function isReconnectEnabled(): bool
+    {
+        return TypeCoercion::boolValue($this->options[TransportOption::RECONNECT->value] ?? null);
+    }
+
+    /**
+     * Returns the re-dial attempts per outage, or null to keep the NATS client's own default.
+     */
+    public function maxReconnectAttempts(): ?int
+    {
+        return $this->nullableIntOption(TransportOption::MAX_RECONNECT_ATTEMPTS);
     }
 
     /**
@@ -284,6 +305,59 @@ final class NatsTransportConfiguration
     }
 
     /**
+     * Returns the JetStream cluster the stream is pinned to, or null to leave placement untouched.
+     *
+     * Normalized with the same {@see TypeCoercion::nonBlankStringValue()} the builder validates with,
+     * so a value handed to the constructor directly is read the way the builder would have stored it:
+     * trimmed, and null when blank or not a string or integer.
+     */
+    public function streamPlacementCluster(): ?string
+    {
+        return TypeCoercion::nonBlankStringValue($this->options[TransportOption::STREAM_PLACEMENT_CLUSTER->value] ?? null);
+    }
+
+    /**
+     * Returns the server tags the stream must be placed on, or null to leave placement untouched.
+     *
+     * Accepts the normalized list the builder stores, a raw list, or a comma-separated string.
+     *
+     * @return list<string>|null
+     */
+    public function streamPlacementTags(): ?array
+    {
+        $tags = TypeCoercion::stringListValue($this->options[TransportOption::STREAM_PLACEMENT_TAGS->value] ?? null);
+
+        return $tags === [] ? null : $tags;
+    }
+
+    /**
+     * Returns the JetStream `placement` block built from the two placement options, or null when
+     * neither is set.
+     *
+     * Used by {@see NatsTransport::setup()} when it creates the stream. On an existing stream the
+     * transport merges each option into the live placement field by field instead, see
+     * {@see NatsTransport::buildUpdatedStreamConfiguration()}.
+     *
+     * @return array{cluster?: string, tags?: list<string>}|null
+     */
+    public function streamPlacement(): ?array
+    {
+        $placement = [];
+
+        $cluster = $this->streamPlacementCluster();
+        if ($cluster !== null) {
+            $placement['cluster'] = $cluster;
+        }
+
+        $tags = $this->streamPlacementTags();
+        if ($tags !== null) {
+            $placement['tags'] = $tags;
+        }
+
+        return $placement === [] ? null : $placement;
+    }
+
+    /**
      * Returns the consumer max-ack-pending limit, or null to use the JetStream default.
      *
      * Caps how many delivered-but-unacknowledged messages a consumer may have outstanding; the
@@ -425,6 +499,18 @@ final class NatsTransportConfiguration
     public function isAutoSetupEnabled(): bool
     {
         return $this->autoSetupEnabled;
+    }
+
+    /**
+     * Returns true when every published message gets an id JetStream deduplicates it by.
+     *
+     * When enabled, {@see NatsTransport::send()} adds a {@see DeduplicationIdStamp} to an envelope that has
+     * none, and publishes the id in the Nats-Msg-Id header. Defaults to false; an id the application adds
+     * itself is used either way.
+     */
+    public function isDeduplicationEnabled(): bool
+    {
+        return $this->deduplicationEnabled;
     }
 
     /**

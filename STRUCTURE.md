@@ -16,7 +16,7 @@ Symfony Messenger  ──dispatch──▶  NatsTransportFactory ──▶ NatsT
 - **Symfony side:** the library implements `TransportInterface`, `MessageCountAwareInterface`,
   and `SetupableTransportInterface`, so it plugs into `messenger:consume`, `messenger:setup-transports`,
   and the failure/retry machinery like any first-party transport.
-- **NATS side:** every operation goes through the async `idct/php-nats-jetstream-client` (`^2.4`,
+- **NATS side:** every operation goes through the async `idct/php-nats-jetstream-client` (`^2.27.1`,
   amphp-based). Calls return `Amp\Future`; the transport resolves them synchronously with `->await()`
   because Symfony Messenger's transport contract is blocking.
 
@@ -24,6 +24,7 @@ Symfony Messenger  ──dispatch──▶  NatsTransportFactory ──▶ NatsT
 
 ```
 src/
+├── IDCTNatsMessengerBundle.php                # Symfony bundle: auto-registers the factory + serializer services
 ├── NatsTransport.php                          # Core transport: send/get/ack/reject/setup/getMessageCount
 ├── NatsTransportFactory.php                   # TransportFactoryInterface - DSN scheme detection + instantiation
 ├── TypeCoercion.php                           # Safe mixed → int/float/string coercion (final, static)
@@ -32,15 +33,32 @@ src/
 │   ├── NatsTransportConfigurationBuilder.php  # Parses DSN + options, validates, builds the NatsClient
 │   ├── RetryHandler.php                        # Enum: SYMFONY (TERM) | NATS (NAK)
 │   └── TransportOption.php                     # Enum of every recognized option key
+├── Stamp/
+│   └── DeduplicationIdStamp.php                # The id JetStream deduplicates a message by (Nats-Msg-Id)
 └── Serializer/
     ├── AbstractEnveloperSerializer.php         # Base encode/decode envelope wrapping + validation
     └── IgbinarySerializer.php                  # Default serializer (igbinary), falls back to PhpSerializer
 
 tests/
-├── bootstrap.php
-├── unit/                                       # PHPUnit 11 - fast, no live NATS required
+├── bootstrap.php                               # autoloader + BypassFinals; takes Infection's file swap over in mutant processes
+├── Support/
+│   ├── ClientInjectedNatsTransport.php         # the transport with a client the test gives it
+│   ├── MessengerTestKernel.php                 # a FrameworkBundle + Messenger kernel for tests that need a compiled container
+│   ├── PhpProcess.php                          # runs a PHP script in a child process
+│   ├── RttCountingNatsClient.php               # the real client, counting the transport's connection checks
+│   ├── StrictHeaderNameSerializer.php          # a serializer that reads header names as strings under strict types
+│   └── SubscriptionLimitNatsServer.php         # a scripted server with a stream, a pull consumer and a subscription limit
+├── unit/                                       # PHPUnit 11 to 13 - fast, no live NATS required
+│   ├── IDCTNatsMessengerBundleTest.php         # the bundle in a compiled kernel: factory discovery, the README serializer
+│   ├── FunctionalSuiteConfigTest.php           # the Behat config fails the functional suite on undefined steps
+│   ├── UnitSuiteConfigTest.php                 # PHPUnit deprecations and, on PHPUnit 13, notices fail the unit suite
 │   ├── NatsTransportTest.php                   # send/get/ack/reject/setup/retry/count/scheduled
 │   ├── NatsTransportFactoryTest.php            # scheme detection, transport creation
+│   ├── MutationTestingBootstrapTest.php        # mutant processes can double final classes and load the mutant
+│   ├── MutationTestingChecksTest.php           # the mutation canary and infection.log checks fail closed
+│   ├── MutationTestingCommandsTest.php         # the Infection runs in composer.json write no GitHub annotations
+│   ├── SubscriptionLimitPullTest.php           # pulls at the subscription limit, real client over a scripted server
+│   ├── UnansweredPullTest.php                  # a pull the server never answered calls for a connection check
 │   ├── Options/
 │   │   ├── NatsTransportConfigurationBuilderTest.php  # DSN parsing, validation, option merging
 │   │   └── NatsTransportConfigurationTest.php          # accessor coercion, defaults
@@ -51,15 +69,39 @@ tests/
 │   ├── features/*.feature                      # setup, batching, consumer, nak, term, delayed, tls, mtls, stream_limits
 │   ├── tests/Behat/NatsSetupContext.php        # all step definitions
 │   └── src/, config/, bin/, public/            # a minimal Symfony app exercising the transport end-to-end
-└── nats/                                       # Docker Compose + NATS configs + test TLS certs
+└── nats/                                       # Docker Compose + NATS configs + test TLS certificate generator
+                                                # (nats-cluster*.conf: the three-server cluster "east" for the examples)
+
+examples/                                       # Runnable scripts, one per behaviour (composer examples)
+├── _bootstrap.php                              # shared setup: autoloader, server, stream, test cluster and docker helpers
+└── *.php                                       # send-and-consume, duplicate-protection, request-timeout, keepalive, connection-checks,
+                                                # reconnect, cluster-failover, stream-placement
+
+scripts/
+├── run-examples.sh                             # runs examples/*.php, strict mode for CI
+├── check-mutation-canary.php                   # composer test:mutation:canary: mutants that change nothing all escape
+└── check-mutation-log.php                      # composer test:mutation:check-log: no mutant killed by the harness
 
 docs/
 ├── CHANGELOG.md                                # Keep a Changelog format
+├── PROJECT_MEMORY.md                           # maintainer context, pitfalls and a dated snapshot for agents
 ├── TESTS.md                                    # Feature → test coverage map (kept in sync with the suite)
 └── PRs/                                         # One file per merged/adapted PR (PR-NNN-*.md)
 ```
 
 ## Components
+
+### IDCTNatsMessengerBundle
+- A thin `AbstractBundle` (no semantic configuration) registering the library's services in the
+  application container, each under one id, its class name: `NatsTransportFactory`, tagged
+  `messenger.transport_factory`, and `IgbinarySerializer`, the README's `serializer:` value. An entry an
+  application defines under the same id, as it had to before the bundle, replaces the bundle's. The
+  serializer must keep that one id: Symfony 7.4+ wraps the serializer a transport names in a
+  `SigningSerializer` once for each id in the transports' configuration, so a second id (an alias) would
+  wrap it twice for the transport naming it, which could then never decode a message that must be signed.
+- Symfony Flex enables the bundle automatically when the package is installed or updated (and leaves it
+  in `config/bundles.php` on a downgrade); without Flex it is added to `config/bundles.php` manually. Manual service registration (the pre-bundle approach) keeps
+  working alongside it.
 
 ### NatsTransportFactory
 - Recognizes two DSN schemes: `nats-jetstream://` and `nats-jetstream+tls://` (see `supports()`).
@@ -72,8 +114,8 @@ The heart of the bridge. Responsibilities map almost 1:1 to `TransportInterface`
 
 | Method | What it does |
 |--------|--------------|
-| `send()` | Stamps a UUIDv4 `TransportMessageIdStamp`, serializes the envelope, publishes to the subject. With headers it uses `requestWithHeaders()` and validates the JetStream publish ack. A `DelayStamp` (when `scheduled_messages` is on) is published to `{topic}.delayed.{uuid}` with `Nats-Schedule` headers. |
-| `get()` | Pulls a batch via `fetchBatch(stream, consumer, batching, timeoutMs)`. JetStream 404 (consumer missing) and 408 (timeout / no messages) are treated as empty. Decodes each message and yields an `Envelope` carrying the JetStream reply token as its `TransportMessageIdStamp`. |
+| `send()` | Stamps a UUIDv4 `TransportMessageIdStamp`, serializes the envelope, publishes to the subject through `JetStreamContext::publish()`, which waits for the publish acknowledgement and throws `JetStreamException` on an error or an invalid acknowledgement. A `DelayStamp` (when `scheduled_messages` is on) is published to `{topic}.delayed.{uuid}` with `Nats-Schedule` headers. A `DeduplicationIdStamp` (added with `deduplicate`) is sent as `Nats-Msg-Id`. With `retry_handler=nats` the copy Symfony's retry sends is not published. |
+| `get()` | Pulls a batch via `fetchBatch(stream, consumer, batching, timeoutMs)`. A pull that found no messages (408, or 404) is an empty result. A missing consumer reports 503: `auto_setup` re-provisions it once, otherwise the error propagates. A pull refused at the connection's subscription limit (the client's `SubscriptionLimitException`) fails with Symfony's `TransportException` naming the stream, the consumer and the limit, since the transport needs two subscriptions per connection (#76). Decodes each message and yields an `Envelope` carrying the JetStream reply token as its `TransportMessageIdStamp`. |
 | `ack()` | Sends JetStream ACK for the message's reply token. |
 | `reject()` | Delegates to `handleFailedDelivery()` → TERM (Symfony retry) or NAK (NATS retry). |
 | `getMessageCount()` | Tries consumer info (`num_ack_pending` / `num_pending`), falls back to stream `state.messages`, then 0. |
@@ -81,11 +123,15 @@ The heart of the bridge. Responsibilities map almost 1:1 to `TransportInterface`
 
 Cross-cutting behavior:
 - **Lazy connection.** No socket is opened in the constructor. `jetStream()` calls `connectIfNeeded()`,
-  which connects on first use and caches the `JetStreamContext`. The client runs with reconnect off, so a
-  lost connection leaves it Closed; `connectIfNeeded()` then dials again on the next operation (#49). A
+  which connects on first use and caches the `JetStreamContext`. Unless `reconnect: true`, the client runs
+  with reconnect off, so a lost connection leaves it Closed; `connectIfNeeded()` then dials again on the
+  next operation (#49). With `reconnect: true` the client recovers a lost connection itself and the transport
+  steps back (`clientOwnsRecovery()`, `keptAfterFailedPing()`, `clientReconnectedSinceSetup()`, #81). A
   connection unused for longer than `ping_after_idle`, or one an operation just failed on (other than with
-  a JetStream reply), is checked with a PING first and replaced when the server does not answer within
-  `connection_timeout`; `keepalive()` skips the check.
+  a JetStream reply; a pull the server did not answer counts as a failure, and so does one refused at the
+  subscription limit, since the server may close the connection right behind that error), is checked with
+  a PING first and replaced when the server does not answer within `connection_timeout` (or
+  `request_timeout`, when that is shorter); `keepalive()` skips the check.
 - **Pull consumers, explicit ACK.** Messages are only considered processed once explicitly ACK'd;
   this is what makes `retry_handler` and shared-consumer load balancing work.
 
@@ -131,8 +177,8 @@ the configuration, and the builder, and covered by its own unit tests plus a fun
 **Sending `new MyMessage()`**
 1. `MessageBus::dispatch()` → Messenger routes to the NATS transport → `NatsTransport::send()`.
 2. UUIDv4 stamp added → serializer encodes to `{body, headers}`.
-3. No headers → `jetStream()->publish(topic, body)->await()`. With headers → `requestWithHeaders()` +
-   `assertJetStreamPublishSucceeded()`.
+3. `jetStream()->publish(topic, body, headers)->await()`: the client waits for the publish acknowledgement
+   and throws `JetStreamException` on an error or an invalid acknowledgement.
 
 **Consuming**
 1. `messenger:consume nats_transport` loops `NatsTransport::get()`.

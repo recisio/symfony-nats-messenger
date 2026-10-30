@@ -1,9 +1,9 @@
 # Symfony NATS Messenger Bridge
 
-[![PHP Version](https://img.shields.io/badge/PHP-^8.1-787CB5?logo=php&logoColor=white)](https://php.net)
-[![Symfony Version](https://img.shields.io/badge/Symfony-^6.4%20%7C%20^7%20%7C%20^8-000000?logo=symfony&logoColor=white)](https://symfony.com)
-[![Unit Tests Coverage](https://img.shields.io/badge/Coverage-99.58%25-brightgreen)](https://github.com/ideaconnect/symfony-nats-messenger/actions)
-[![Mutation MSI](https://img.shields.io/badge/Mutation%20MSI-100%25-brightgreen)](https://infection.github.io/)
+[![PHP Version](https://img.shields.io/badge/PHP-^8.2-787CB5?logo=php&logoColor=white)](https://php.net)
+[![Symfony Version](https://img.shields.io/badge/Symfony-^7.2%20%7C%20^8.0-000000?logo=symfony&logoColor=white)](https://symfony.com)
+[![Unit Tests Coverage](https://img.shields.io/badge/Coverage-99.78%25-brightgreen)](https://github.com/ideaconnect/symfony-nats-messenger/actions)
+[![Mutation MSI](https://img.shields.io/badge/Mutation%20MSI-96.9%25-brightgreen)](https://infection.github.io/)
 [![Functional Tests](https://img.shields.io/badge/Functional%20Tests-Behat-blue)](tests/functional)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![CI](https://github.com/ideaconnect/symfony-nats-messenger/actions/workflows/ci.yml/badge.svg)](https://github.com/ideaconnect/symfony-nats-messenger/actions/workflows/ci.yml)
@@ -11,17 +11,21 @@
 
 A Symfony Messenger transport integration for [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream), enabling reliable asynchronous messaging with persistent message streaming.
 
-This repository is a `recisio`-maintained fork intended to keep the package usable on PHP 8.1.
-
 ## Features
 
 - 🚀 **High-Performance Messaging** - Leverage NATS JetStream for fast, reliable message delivery
-- 📦 **Symfony Integration** - Implements Messenger's `TransportInterface`, `MessageCountAwareInterface`, and `SetupableTransportInterface`
+- 📦 **Symfony Integration** - Implements Messenger's `TransportInterface`, `MessageCountAwareInterface`, `SetupableTransportInterface`, `KeepaliveReceiverInterface`, and `CloseableTransportInterface`
 - ⚙️ **Configurable Consumers** - Support for multiple consumer strategies
 - 🔄 **Flexible Batching** - Adjustable message batch sizes and timeouts
 - 🔐 **Authentication Support** - Built-in support for NATS authentication
 - 📊 **Stream Configuration** - Configurable retention policies and replication
-- 🧪 **Thoroughly Tested** - 303 unit tests, ~99.6% coverage, mutation-tested (100% MSI)
+- 📍 **Stream Placement** - Pin a stream to a JetStream cluster and to tagged servers; an option you set
+  changes only its own half of an existing placement (see [Stream Placement](#stream-placement))
+- 🔁 **Automatic Reconnect** - Optional mode in which the NATS client recovers a lost connection and a worker
+  polls through an outage instead of exiting (see [Automatic Reconnect](#automatic-reconnect))
+- 🌐 **NATS Clusters** - One server in the DSN, the others learned from the cluster; failover, replicated streams
+  and TLS on a cluster (see [Using a NATS Cluster](#using-a-nats-cluster))
+- 🧪 **Thoroughly Tested** - 673 unit tests, ~99.8% coverage, mutation-tested (96.9% MSI)
 
 ## 🚀 This project looks for funding. Love my work? Support it! 💖
 
@@ -32,15 +36,108 @@ This repository is a `recisio`-maintained fork intended to keep the package usab
 ## Requirements
 
 ### System Requirements
-- **PHP**: ^8.1
-- **Symfony**: ^6.4 || ^7 || ^8
-- **NATS Server**: ^2.9 with JetStream enabled, ^2.12 for scheduled messages support.
+- **PHP**: ^8.2
+- **Symfony**: ^7.2 || ^8
+- **NATS Server**: ^2.9 with JetStream enabled, ^2.12 for scheduled messages support and for `!` exclusion
+  tags in `stream_placement_tags`.
 
 ## Installation
 
 ```bash
 composer require idct/symfony-nats-messenger
 ```
+
+The package ships `IDCTNatsMessengerBundle`, which registers the transport factory and
+the igbinary serializer for you - no per-project `services.yaml` entries are required.
+With Symfony Flex the bundle is enabled automatically when the package is installed or updated. Without
+Flex, enable it manually:
+
+```php
+// config/bundles.php
+return [
+    // ...
+    IDCT\NatsMessenger\IDCTNatsMessengerBundle::class => ['all' => true],
+];
+```
+
+If you leave the bundle out, register the transport factory yourself. Messenger finds it by its tag, and
+nothing else registers it, so without it every `nats-jetstream://` DSN fails with "No transport supports
+Messenger DSN":
+
+```yaml
+# config/services.yaml (only without the bundle)
+services:
+    IDCT\NatsMessenger\NatsTransportFactory:
+        tags: [messenger.transport_factory]
+```
+
+> **Tested by:** `transportFactoryIsRegisteredAndTaggedForMessengerDiscovery`, `withoutTheBundleNoTransportFactorySupportsANatsDsn`, `theReadmesIgbinaryExampleGivesTheTransportTheIgbinarySerializer`, `theReadmesSetupWithoutTheBundleGivesAWorkingTransport` - the functional Behat suite also runs entirely on the bundle's service registration.
+
+### Upgrading from 5.4 or earlier
+
+- With Symfony Flex, updating the package adds the bundle to `config/bundles.php`, as installing it does.
+  Commit that change with the update.
+- The `services.yaml` entries you added for the transport keep working next to the bundle, and you can
+  delete them, with one exception: the bundle does not register the `igbinary_serializer` id earlier
+  versions of this README suggested. If a transport has `serializer: 'igbinary_serializer'`, change it to
+  `serializer: 'IDCT\NatsMessenger\Serializer\IgbinarySerializer'` before you delete that entry, or keep
+  the entry. Otherwise the container cannot be built, because the service the transport names is gone.
+- Going back to 5.4 or earlier does not take the bundle out of `config/bundles.php`. The application then
+  stops with `Class "IDCT\NatsMessenger\IDCTNatsMessengerBundle" not found`, and so does every
+  `composer install` or `composer update` that clears the cache. Delete the line when you downgrade, and
+  add it back yourself if you update again later: Flex configures a package once, and the package's entry
+  in `symfony.lock` stays after the downgrade.
+
+> **Tested by:** `theServiceEntriesUsedBeforeTheBundleKeepWorking`, `theReadmesIgbinaryExampleGivesTheTransportTheIgbinarySerializer`
+
+### Upgrading from 5.6
+
+Nothing to change. The [`reconnect`](#automatic-reconnect) option is off by default, and with it off the
+transport recovers a lost connection as before. Two differences apply in either mode:
+
+- A pull the server ended for its own shutdown (`409 Server Shutdown`) or for a leadership change
+  (`409 Leadership Change`) is an empty batch now, not a missing consumer. With `auto_setup` the transport no
+  longer runs `setup()` against a server that is going away, which failed every graceful stop of the server
+  with "Failed to setup NATS stream" and ended the worker. Every other 409 keeps its meaning.
+- If the application has a `logger` service, the bundle hands it to the NATS client, which writes its
+  connection lifecycle at info level and its errors at error level, under Monolog's `messenger` channel (see
+  [Logging](#logging)). Those lines went nowhere before.
+
+> **Tested by:** `testAPullTheServerEndedForItsShutdownIsEmptyAndTheNextOperationChecksTheConnection`, `testA409ReportingAConfigurationErrorStaysVisible`, `theBundleHandsTheApplicationsLoggerToTheFactory`, the example `reconnect.php`
+
+### Upgrading from 5.7.0
+
+Nothing to change. 5.7.1 requires `idct/php-nats-jetstream-client` 2.27.1 or later, which `composer update`
+installs. With `reconnect: true`, an `ack()` or `reject()` whose write is the first to notice a lost connection
+now returns at once, its frame buffered for the connection the client's recovery makes, where with client 2.27.0
+it waited for that recovery (see [Automatic Reconnect](#automatic-reconnect)). With the option off nothing
+changes.
+
+> **Tested by:** `testAnAcknowledgementWhoseWriteFindsTheConnectionLostReturnsAtOnceAndTheRecoverySendsIt`
+
+### Logging
+
+The NATS client reports what it does with the connection through a PSR-3 logger: the connection's lifecycle
+(connected, reconnected, closed) at info level, a reconnect attempt that failed at warning level, and its
+errors at error level. Among the errors is the only trace of acknowledgements lost to an outage with
+[`reconnect: true`](#automatic-reconnect): `Reconnect exhausted: N bytes of buffered publishes were discarded`.
+There is no debug-level chatter, so a wired logger costs a few lines per connection.
+
+With the bundle, the application's `logger` service is handed to the factory, tagged for Monolog's
+`messenger` channel, so the client's lines land next to the worker's. Without that service, or without the
+bundle, the client gets no logger, as before 5.7.0. To wire one yourself, give it to the factory, which hands
+it to every transport it creates, or to a transport constructed directly, as the fourth constructor
+argument: `new NatsTransport($dsn, $options, $serializer, $logger)`.
+
+```yaml
+# config/services.yaml (without the bundle, with a logger)
+services:
+    IDCT\NatsMessenger\NatsTransportFactory:
+        arguments: ['@?logger']
+        tags: [messenger.transport_factory]
+```
+
+> **Tested by:** `testBuildPassesTheLoggerToTheClientAndNoneByDefault`, `createTransport_HandsTheFactorysLoggerToTheClient`, `theBundleHandsTheApplicationsLoggerToTheFactory`, `theFactoryIsTaggedForMonologsMessengerChannel`, `testAReconnectThatGivesUpWithABufferedAcknowledgementIsReportedToTheLoggerAndTheNextOperationFails`, the examples `reconnect.php` and `cluster-failover.php`
 
 ### Development Setup
 
@@ -119,18 +216,23 @@ framework:
           consumer: 'my-consumer'
 ```
 
-Register the serializer service the `serializer:` key refers to. For example:
-```yaml
-    igbinary_serializer:
-        class: IDCT\NatsMessenger\Serializer\IgbinarySerializer
-```
+The `IDCT\NatsMessenger\Serializer\IgbinarySerializer` service the `serializer:` key refers to is
+registered by `IDCTNatsMessengerBundle` (see [Installation](#installation)), so the configuration
+above works as-is. Only when the bundle is not enabled do you need to register it yourself, next to the
+transport factory:
 
-or:
 ```yaml
+# config/services.yaml (only without the bundle)
+services:
     IDCT\NatsMessenger\Serializer\IgbinarySerializer: ~
 ```
 
-> **Tested by:** `createTransport_UsesProvidedSerializer`, `serialize_WithValidEnvelope_ReturnsSerializedString`, `decode_WithValidEncodedEnvelope_ReturnsEnvelope`, `testConstructorWithoutIgbinaryDoesNotCrash`
+Like Symfony's own serializers, it leaves out the stamps Symfony marks as not to be sent
+(`NonSendableStampInterface`), such as the `AckStamp` a worker adds to the message it handles, so a message
+Symfony re-sends for a retry or to the failure transport is serialized without them. Any serializer extending
+`AbstractEnveloperSerializer` does the same.
+
+> **Tested by:** `createTransport_UsesProvidedSerializer`, `serialize_WithValidEnvelope_ReturnsSerializedString`, `decode_WithValidEncodedEnvelope_ReturnsEnvelope`, `testConstructorWithoutIgbinaryDoesNotCrash`, `theReadmesIgbinaryExampleGivesTheTransportTheIgbinarySerializer`, `theReadmesSetupWithoutTheBundleGivesAWorkingTransport`, `aSignedMessageSurvivesTheSerializerUnderEveryIdTheBundleGivesIt`, `encode_EnvelopeAWorkerIsHandling_EncodesWithoutItsNonSendableStamps`, `encode_WithNonSendableStamps_LeavesThemOutAndKeepsTheRest`, Behat scenario `Failed message routed to Symfony failure transport via TERM with the igbinary serializer`
 
 #### Creating Custom Serializers
 
@@ -207,6 +309,33 @@ symfony console messenger:consume nats_transport
 
 > **Tested by:** Behat scenarios `Complete message flow - send, check stats, consume, verify`, `Send and consume messages with a custom consumer name`, and `Partial message consumption with multiple consumers` - the Behat context runs `messenger:consume` as a Symfony CLI process.
 
+## Examples
+
+[`examples/`](examples/) holds runnable scripts, one per behaviour, that use the transport directly against
+the test server and print `OK` when what they show held:
+
+| Example | Shows |
+|---|---|
+| `send-and-consume.php` | `setup()`, sending, the queue depth, receiving and acknowledging |
+| `duplicate-protection.php` | `DeduplicationIdStamp` and `deduplicate: true`: a message sent again is stored once |
+| `request-timeout.php` | `request_timeout`, and sending again, with the same deduplication id, a message whose send timed out |
+| `keepalive.php` | `keepalive()` from a SIGALRM handler, as `messenger:consume --keepalive` calls it |
+| `connection-checks.php` | `ping_after_idle`, and a new dial once the connection is gone |
+| `reconnect.php` | `reconnect: true`: a worker polls through a restart of its server, and `auto_setup` recreates the memory stream the restart lost |
+| `cluster-failover.php` | `reconnect: true` on a cluster: a worker carries on through another server when the one it is connected to stops |
+| `stream-placement.php` | `stream_placement_tags` and `stream_placement_cluster` on a cluster, and staging a move with a replica change |
+
+`composer nats:start` runs a three-server JetStream cluster for the last two next to the single test servers;
+[`examples/README.md`](examples/README.md#the-test-cluster) describes it, and
+[Using a NATS Cluster](#using-a-nats-cluster) what they mean for an application.
+
+```bash
+composer nats:start
+composer examples                   # or one at a time: php examples/keepalive.php
+```
+
+> **Tested by:** CI runs `composer examples` after the functional suite, on the latest and the oldest supported NATS.
+
 ## Configuration Guide
 
 ### DSN Format
@@ -258,6 +387,17 @@ framework:
                                             # operation checks it with a PING and dials again if the
                                             # server does not answer (default: 30; 0 turns it off).
                                             # See "Losing the Connection".
+          request_timeout: 10               # Seconds to wait for the server's reply to a publish,
+                                            # an ack_sync ACK, setup() or a message count (default: 10)
+
+          # Connection Resilience
+          reconnect: false                  # Who recovers a lost connection (default: false)
+                                            # false => the operation in flight fails and the transport dials
+                                            #          again on the next one; a worker exits and is restarted
+                                            # true  => the NATS client re-dials in the background and the
+                                            #          operations wait for it (see Automatic Reconnect)
+          max_reconnect_attempts: null      # Attempts per recovery before the client gives up
+                                            # (null = the client's own default of 10). Positive integer.
 
           # Consumer Flow Control & Lifecycle
           max_ack_pending: 1000             # Max delivered-but-unacked messages outstanding
@@ -317,7 +457,14 @@ framework:
           stream_allow_rollup_headers: false # Allow Nats-Rollup headers
 
           # High Availability
-          stream_replicas: 1                # Number of replicas (default: 1)
+          stream_replicas: 1                # Number of replicas of a new stream (default: 1). Unset,
+                                            # an existing stream keeps its count. More than 1 needs a
+                                            # JetStream cluster (see "Using a NATS Cluster").
+          stream_placement_cluster: null    # Pin the stream to a named JetStream cluster
+                                            # (null = leave the stream's placement untouched)
+          stream_placement_tags: null       # Only place the stream on servers carrying ALL of these
+                                            # tags, e.g. ['ssd', 'eu-west'] (or 'ssd,eu-west' in a DSN)
+                                            # (null = leave the stream's placement untouched)
 
           # Failure Handling Strategy
           retry_handler: 'symfony'          # symfony|nats (default: symfony)
@@ -336,6 +483,10 @@ framework:
                                             # message redelivering forever under retry_handler: nats.
           backoff: null                     # List of per-attempt delays in seconds, e.g. [1, 5, 30].
                                             # Pairs with max_deliver. (default: null)
+
+          # Duplicate Protection
+          deduplicate: false                # Give every message an id JetStream deduplicates it by
+                                            # within stream_duplicate_window (default: false)
 
           # Acknowledgement Mode
           ack_sync: false                   # Wait for server confirmation of each ACK (default: false)
@@ -361,7 +512,9 @@ framework:
           tls_key_file: null                # Path to client private key
           tls_key_passphrase: null          # Passphrase for encrypted private key
           tls_peer_name: null               # Override TLS peer name for certificate validation
-          tls_verify_peer: true             # Verify TLS peer certificate (default: true)
+          tls_verify_peer: true             # Verify TLS peer certificate (default: true). Only
+                                            # false, 0, no or off turns it off; any other value,
+                                            # an empty one included, keeps it on
 
           # Additional Authentication
           token: null                       # NATS token authentication
@@ -371,12 +524,25 @@ framework:
           nkey: null                        # NKey public value
 ```
 
-> **Tested by:** `testReadmeConfigurationOptionsAreAccepted` (all options above), `testReadmeBatchingExamplesAreAccepted`, `testReadmeTimeoutExamplesAreAccepted`, `testReadmeStreamRetentionExamplesAreAccepted`, `testBuildAcceptsAndNormalizesNewStreamAndConsumerOptions`, `testSetupPassesNewStreamPolicyOptions`, `testSetupPassesNewConsumerOptions`, `testBuildWithTlsAndAuthOptionsPropagatesToNatsOptions`
+> **Tested by:** `testReadmeConfigurationOptionsAreAccepted` (all options above), `testReadmeBatchingExamplesAreAccepted`, `testReadmeTimeoutExamplesAreAccepted`, `testReadmeStreamRetentionExamplesAreAccepted`, `testBuildAcceptsAndNormalizesNewStreamAndConsumerOptions`, `testSetupPassesNewStreamPolicyOptions`, `testSetupPassesNewConsumerOptions`, `testBuildWithTlsAndAuthOptionsPropagatesToNatsOptions`, `testTlsVerifyPeerStaysOnUnlessExplicitlyDisabled`, `testTlsVerifyPeerInTheDsnStaysOnUnlessExplicitlyDisabled`, `testBuildAcceptsStreamPlacementOptions`, `testBuildWithReconnectOptionsPropagatesToNatsOptions`
 
 ### Retry Handler Behavior
 
 - `retry_handler: symfony` (default) sends `TERM` when a message fails during transport decoding or is rejected. Symfony's retry/failure transport then handles redelivery.
 - `retry_handler: nats` sends `NAK` when a message fails during transport decoding or is rejected, so NATS redelivers the message itself.
+
+**Symfony's retry delays need `scheduled_messages: true`.** Symfony's retry strategy waits between attempts
+(1, 2 and 4 seconds with the framework's default strategy) by re-sending the failed message with a
+`DelayStamp`. The transport applies a `DelayStamp` only when `scheduled_messages` is enabled, which needs
+NATS 2.12 or later, and otherwise publishes the message at once. So with the defaults, each retry runs right
+after the failure, all of them are used up within milliseconds, and nothing reports that the delays were
+dropped. To keep the delays:
+
+- on NATS 2.12 or later, enable `scheduled_messages` (see [Delayed / Scheduled Messages](#delayed--scheduled-messages));
+- on an older server, let NATS space out the attempts instead: `retry_handler: nats` with `nak_delay` or
+  `backoff`, bounded by `max_deliver`, and with `max_retries: 0` (see below).
+
+> **Tested by:** `testSendWithDelayStampButScheduledMessagesDisabledPublishesNormally`, `testSendWithDelayStampPublishesToDelayedSubjectWithScheduleHeaders`
 
 When NATS manages redelivery (`retry_handler: nats`), tune it with `nak_delay`, `ack_wait`, `max_deliver`, and `backoff`:
 
@@ -385,7 +551,57 @@ When NATS manages redelivery (`retry_handler: nats`), tune it with `nak_delay`, 
 - **`backoff`** sets an escalating per-attempt delay schedule (e.g. `[1, 5, 30]` seconds); pair it with `max_deliver` greater than the number of backoff steps.
 - **`ack_wait`** is how long JetStream waits for an ACK before considering a delivery failed and redelivering - raise it for handlers that legitimately take a while.
 
-> **Tested by:** `testRejectUsesTermByDefault`, `testRejectUsesNakWhenRetryHandlerIsNats`, `testHandleFailedDeliveryUsesNakWithDelayWhenConfigured`, `testSetupAppliesConsumerRetryTuning`, `testBuildAcceptsNatsRetryTuningOptions`, `testBuildUsesRetryHandlerFromQuery`, Behat scenarios `nats_nak.feature` and `nats_term.feature`
+**Symfony's retry strategy is ignored with `retry_handler: nats`.** Symfony's retry listener runs for every
+transport, and FrameworkBundle gives each one a retry strategy (`max_retries: 3` by default). In nats mode the
+transport does not publish the copy that retry sends, because NATS redelivers the original after the NAK, so
+`max_retries`, `delay` and `multiplier` have no effect and `max_deliver` bounds the attempts. Set
+`max_retries: 0` on the transport anyway: with retries left on, Symfony still logs each failure as a retry it
+never makes ("Sending for retry #1") and never treats the message as failed for good.
+
+A failure transport does not combine well with nats mode. Symfony sends a message there each time it treats a
+failure as final: with `max_retries: 0` that is every failed delivery, so a message that keeps failing lands
+there up to `max_deliver` times, and with retries left on it never lands there. For a transport in nats mode,
+rely on NATS's own handling of a message that keeps failing instead (`max_deliver`, and the JetStream
+`MAX_DELIVERIES` advisory).
+
+```yaml
+framework:
+  messenger:
+    transports:
+      nats_transport:
+        dsn: 'nats-jetstream://localhost:4222/my-stream/my-topic?retry_handler=nats&max_deliver=5&nak_delay=10'
+        retry_strategy:
+          max_retries: 0
+```
+
+> **Tested by:** `testRejectUsesTermByDefault`, `testRejectUsesNakWhenRetryHandlerIsNats`, `testHandleFailedDeliveryUsesNakWithDelayWhenConfigured`, `testSetupAppliesConsumerRetryTuning`, `testBuildAcceptsNatsRetryTuningOptions`, `testBuildUsesRetryHandlerFromQuery`, `testNatsModeDoesNotPublishTheCopySymfonysRetrySends`, `testWorkerRetryInNatsModeNaksTheOriginalWithoutPublishingACopy`, Behat scenarios `nats_nak.feature`, `nats_term.feature` and `Symfony's retry strategy is ignored with the NATS retry handler`
+
+### Long-Running Handlers (`--keepalive`)
+
+NATS redelivers a message that is not acknowledged within the consumer's `ack_wait` (30 seconds unless set),
+possibly to another worker, even while a handler is still working on it. `messenger:consume --keepalive`
+prevents that: every few seconds (5 by default, `--keepalive=N` to change it) Symfony has the transport tell
+NATS that the message is still in progress, which restarts its `ack_wait`.
+
+```bash
+symfony console messenger:consume nats_transport --keepalive=10
+```
+
+Symfony sends the keepalive from a `SIGALRM` signal handler, which needs the `pcntl` extension and can
+interrupt the handler at any point. The NATS client is asynchronous, and PHP does not let it wait inside a
+signal handler, so the transport queues the in-progress acknowledgement there, and it goes out the next time
+the event loop runs:
+
+- **A handler that waits on asynchronous work** - any call to NATS through this library, such as dispatching
+  a message to a NATS transport, or amphp-based I/O - lets it out at once, so the keepalive works as intended.
+- **A handler that only blocks** - plain PHP work, or blocking calls such as PDO queries or curl requests -
+  lets it out only once it returns, too late to restart the timer. For such a handler, set `ack_wait` longer
+  than its longest run instead.
+
+Keep the keepalive interval well below `ack_wait`, so a keepalive that goes out a little late still arrives in
+time.
+
+> **Tested by:** `testKeepaliveSendsInProgressForReplyToken`, `testKeepaliveFromASignalHandlerQueuesTheAcknowledgementInsteadOfWaiting`, `testKeepaliveDoesNotWaitForTheAcknowledgement`, `testKeepaliveWithoutAConnectionSendsNothingAndDoesNotDial`, `testKeepaliveWhoseAcknowledgementFailsRaisesNoUnhandledError`, Behat scenario `A message handled for longer than ack_wait is not redelivered while keepalive runs`
 
 ## Important: Consumer Strategies
 
@@ -505,21 +721,77 @@ options:
 
 **Purpose:**
 - Sets the timeout for the initial TCP/TLS dial and handshake when connecting to NATS
-- Also bounds the PING that checks a connection which sat idle (`ping_after_idle`): a server that does not answer within it is treated as gone
-- Does **not** govern per-operation read/write timeouts (publish/ack/request keep the client's own request timeout); the batch fetch is bounded separately by `max_batch_timeout`
-- Lower values fail faster on connection issues
+- Also bounds the PING that checks a connection before it is used again, after it sat idle or after an operation failed on it (`ping_after_idle`), unless `request_timeout` is shorter: a server that does not answer within it is treated as gone
+- Does **not** bound how long an operation waits for the server's reply, which is `request_timeout`; the batch fetch is bounded separately by `max_batch_timeout`
+- Bounds each dial attempt: a dial that fails is tried three times, with pauses of 2 and 4 seconds in between
+- Lower values fail faster only when an attempt hangs, as with an unreachable host (about 6 seconds plus three times the value in all); a refused connection fails after about 6 seconds whatever the value
 - Higher values tolerate slower connection establishment
 
 **When to adjust:**
 - Increase for high-latency networks or geographically distant NATS servers
 - Decrease for faster failure detection in local environments
 - Default of 1 second works well for most local/regional deployments
-- Don't wait forever for the batch to fill
+
+### Request Timeout
+
+Controls how long an operation waits for the server's reply: the publish acknowledgement of `send()`, the
+confirmation of an ACK with `ack_sync`, and the JetStream API calls of `setup()` and `getMessageCount()`:
+
+```yaml
+options:
+  request_timeout: 30  # seconds (default: 10)
+```
+
+> **Tested by:** `testRequestTimeoutDefaultsToTenSeconds`, `testBuildWithRequestTimeoutPropagatesMs`, `testBuildWithInvalidRequestTimeoutThrowsException`, `testReadmeTimeoutExamplesAreAccepted` (10, 30)
+
+A reply that does not arrive in time fails the operation with the client's `TimeoutException`. For `send()`
+that does not prove the message was not stored: the server may have stored it and only its acknowledgement
+was late, so dispatching the message again can store it twice, unless it carries a deduplication id (see
+[Duplicate Protection](#duplicate-protection)). Raise the value for a slow or distant server,
+or for a stream whose writes can take long, such as a replicated one under load; lower it to fail faster.
+The wait of a pull in `get()` is bounded by `max_batch_timeout` instead (the client gives up a second later
+on a pull the server does not answer at all), and the dial by `connection_timeout`.
+
+### Duplicate Protection
+
+A `send()` that timed out may still have stored the message (see [Request Timeout](#request-timeout)), so
+dispatching it again can store it twice. JetStream drops a message whose `Nats-Msg-Id` it already stored within
+the stream's duplicate window (`stream_duplicate_window`, 2 minutes unless set), and the transport fills that
+header from a `DeduplicationIdStamp`:
+
+```php
+use IDCT\NatsMessenger\Stamp\DeduplicationIdStamp;
+
+// Dispatched again with the same id after a send() that failed, the message is stored once.
+$bus->dispatch(new OrderPlaced($orderId), [new DeduplicationIdStamp('order-placed-' . $orderId)]);
+```
+
+With `deduplicate: true` the transport gives every message an id of its own on its first send. The id is sent
+with the message, so a copy sent again keeps it, which covers what Symfony sends again itself: a worker that
+stopped after a retry or failure-transport send that timed out, the server having stored the copy, gets the
+original redelivered by NATS after `ack_wait` and sends the same copy again, which JetStream drops. For that,
+`stream_duplicate_window` has to be longer than `ack_wait` plus the handler's run. Each of Symfony's retries,
+and the copy for a failure transport, gets an id of its own, so none of them is taken for the original. An id
+you add yourself, as above, is used with the option off as well, and covers a message your application
+dispatches again as a new envelope, which would otherwise get a new id.
+
+The header holds the id together with the transport's subject and the retry count, and on a failure-transport
+copy the transport the message failed on. JetStream deduplicates per stream whatever the subject, and Symfony
+hands each transport a message is routed to the envelope the one before returned, id included, so transports
+that share a stream (see [Multi-Subject Streams](#multi-subject-streams)) each keep their copy.
+
+```yaml
+options:
+  deduplicate: true   # default: false
+```
+
+> **Tested by:** `testSendWithDeduplicationStampsTheEnvelopeAndPublishesItsMessageId`, `testSendKeepsTheDeduplicationIdTheEnvelopeCarries`, `testSendGivesEachRetryAndTheFailureTransportCopyAMessageIdOfItsOwn`, `testSendWithoutDeduplicationSendsNoMessageIdAndAddsNoStamp`, `testSendUsesAnApplicationDeduplicationIdWithTheOptionOff`, `testSendDelayedMessageWithDeduplicationPublishesItsMessageId`, `testDeduplicateIsOffByDefaultAndCanBeEnabled`, `testSendGivesTheCopiesForTwoTransportsOnOneStreamMessageIdsOfTheirOwn`, `testSendGivesTheFailureCopiesOfTwoTransportsMessageIdsOfTheirOwn`, Behat scenarios `A message dispatched again with the same deduplication id is stored once`, `Distinct messages are all stored with the deduplicate option` and `A message routed to two deduplicating transports on one stream is stored for each`
 
 ### Losing the Connection
 
-The transport does not reconnect in the background, and nothing in Symfony calls `close()`. When the
-connection has been lost, the next operation dials again instead:
+Unless [`reconnect`](#automatic-reconnect) is on, the transport does not reconnect in the background, and
+nothing in Symfony calls `close()`. When the connection has been lost, the next operation dials again
+instead:
 
 - A connection is lost when the NATS server restarts, when the network drops it, or when the server closes
   it because the client stopped answering its pings. A PHP process answers them only while it is inside a
@@ -527,29 +799,154 @@ connection has been lost, the next operation dials again instead:
   minutes; a load balancer or NAT gateway may drop an idle connection sooner.
 - The operation that runs into the lost connection fails. For `send()` that means the outcome is unknown:
   the server may or may not have stored the message. Once the client reports the connection closed, the
-  next operation opens a new one. A consumer worker exits on the failed `get()` and its supervisor starts a
-  new one; a process that sends for longer than one request (a web app in worker mode such as FrankenPHP or
-  RoadRunner, a daemon, a handler that dispatches) keeps working from the next operation on.
+  next operation opens a new one, on a cluster possibly to another server (see
+  [Using a NATS Cluster](#using-a-nats-cluster)). A consumer worker exits on the failed `get()` and its
+  supervisor starts a new one; a process that sends for longer than one request (a web app in worker mode
+  such as FrankenPHP or RoadRunner, a daemon, a handler that dispatches) keeps working from the next
+  operation on.
 - With `auto_setup`, the new connection is verified in the same call that dials it, and a dial that fails
   surfaces as the connection error itself.
 
 A connection that was dropped while it sat idle would make the next operation the one that fails. To avoid
 that, an operation that finds the connection unused for longer than `ping_after_idle` (30 seconds by
-default) first checks it with one PING. If the server does not answer within `connection_timeout`, the
-transport closes that connection and runs the operation on a new one, so the first message after a quiet
-period goes out instead of failing. The PING costs one round trip, and only after a quiet period. A lower
-value also catches a server restart between two operations further apart than it, at the cost of that round
-trip more often. The same check follows an operation that failed on the connection - a JetStream error
-reply does not count, since the server answered it - because the client can keep reporting a dead connection
-open, and a connection that silently stopped delivering only times out. `ping_after_idle: 0` turns both
-checks off. `keepalive()` never checks: Symfony calls it from a signal handler.
+default) first checks it with one PING. If the server does not answer within `connection_timeout` (or
+`request_timeout`, when that is shorter), the transport closes that connection and runs the operation on a
+new one, so the first message after a quiet period goes out instead of failing. The PING costs one round
+trip, and only after a quiet period. A lower value also catches a server restart between two operations
+further apart than it, at the cost of that round trip more often. The same check follows an operation that
+failed on the connection - a JetStream error reply does not count, since the server answered it - because
+the client can keep reporting a dead connection open, and a send to a connection that silently stopped
+delivering only times out. A pull from such a connection ends empty, which reads as no messages rather than
+a failure, but the server never answered it: a server that is there ends every pull itself, after
+`max_batch_timeout` at the latest. So the check follows such a pull too, and the pull after it runs on a new
+connection. `ping_after_idle: 0` turns both checks off. `keepalive()` never checks: Symfony calls it from a
+signal handler.
 
 ```yaml
 options:
   ping_after_idle: 30   # seconds; 0 turns the check off
 ```
 
-> **Tested by:** `testOperationAfterTheClientClosedDialsAgain`, `testAutoSetupVerifiesTheNewConnectionBeforeTheSameCallPublishes`, `testFailedDialAfterTheClientClosedSurfacesAsTheConnectionErrorAndIsRetried`, `testIdleConnectionIsCheckedWithAPingAndKeptWhenTheServerAnswers`, `testIdleConnectionThatDoesNotAnswerThePingIsReplacedBeforeTheOperation`, `testPingUnansweredWithinTheConnectionTimeoutReplacesTheConnection`, `testRecentlyUsedConnectionIsNotPinged`, `testPingAfterIdleZeroTurnsTheCheckOff`, `testKeepaliveNeitherPingsNorDials`, `testOperationThatFailedOnTheConnectionMakesTheNextOneCheckItFirst`, `testJetStreamReplyDoesNotMakeTheNextOperationCheckTheConnection`, `testBuildWithInvalidPingAfterIdleThrowsException`
+> **Tested by:** `testOperationAfterTheClientClosedDialsAgain`, `testAutoSetupVerifiesTheNewConnectionBeforeTheSameCallPublishes`, `testFailedDialAfterTheClientClosedSurfacesAsTheConnectionErrorAndIsRetried`, `testIdleConnectionIsCheckedWithAPingAndKeptWhenTheServerAnswers`, `testIdleConnectionThatDoesNotAnswerThePingIsReplacedBeforeTheOperation`, `testPingUnansweredWithinTheConnectionTimeoutReplacesTheConnection`, `testRecentlyUsedConnectionIsNotPinged`, `testPingAfterIdleZeroTurnsTheCheckOff`, `testKeepaliveNeitherPingsNorDials`, `testOperationThatFailedOnTheConnectionMakesTheNextOneCheckItFirst`, `testJetStreamReplyDoesNotMakeTheNextOperationCheckTheConnection`, `testPullTheServerDidNotAnswerMakesTheNextOperationCheckTheConnection`, `testOnlyAPullTheServerDidNotAnswerMakesTheNextOneCheckTheConnection`, `testIdleTimeCountsFromTheEndOfAnEmptyPull`, `testBuildWithInvalidPingAfterIdleThrowsException`, Behat scenarios `A message sent after the server dropped the idle connection goes out` and `Without the check the message sent after the server dropped the connection fails`
+
+### Subscription Limits
+
+The transport holds up to two subscriptions on its connection: the reply inbox of its requests, which the first
+`send()`, `ack_sync` acknowledgement, `setup()` or `getMessageCount()` on a connection subscribes, and the reply inbox
+of the pull in progress. NATS caps the subscriptions a connection may hold at the smallest of the server's
+`max_subscriptions`, the account's limit and the user's. With a cap of one, the server refuses the pull's inbox with
+`maximum subscriptions exceeded`, and every pull after the first request on that connection fails. `get()` then
+throws Symfony's `TransportException`, with the client's `SubscriptionLimitException` as its previous exception:
+
+```text
+Cannot pull from NATS stream "orders", consumer "worker": the subscription limit was exceeded. This transport requires capacity for at least two subscriptions per connection. Check server, account and user limits.
+```
+
+Like any exception from `get()`, it ends a worker's run. Raise the limit to at least two. The operation after the
+failure checks the connection first, as after any other failure on it (see
+[Losing the Connection](#losing-the-connection)): the server sends the same error when an account's limit is lowered
+below what the connection holds, and closes the connection right behind it.
+
+> **Tested by:** `testAtALimitOfOneThePullFailsWithATransportExceptionNamingTheLimit`, `testAtALimitOfOneAPullWhoseRefusalTheHeartbeatReadsFailsTheSameWay`, `testAtALimitOfTwoPullsDeliverAndAcknowledge`, `testALimitErrorTheServerClosesTheConnectionBehindKeepsTheCheckBeforeTheNextOperation`, `testALimitErrorTheServerClosesTheConnectionBehindLeavesAClosedClientThatIsReplacedWithoutACheck`, `testPullRefusedAtTheSubscriptionLimitFailsWithATransportExceptionAndTheNextOperationChecksTheConnection`, `testAutoSetupRetriedPullRefusedAtTheSubscriptionLimitFailsWithATransportException`, `testPullThatFailedOnTheConnectionOtherwisePropagatesAsItIs`
+
+### Automatic Reconnect
+
+Who recovers a lost connection is a choice between two modes.
+
+**`reconnect: false` (the default): Symfony owns recovery.** The NATS client runs with reconnect off. The
+operation that runs into the lost connection fails at once, the next one dials again, a consumer worker exits
+on the failed `get()` and its supervisor starts a new one, and Symfony's retries and failure transport take
+care of the message. See [Losing the Connection](#losing-the-connection); nothing below applies.
+
+**`reconnect: true`: the client owns recovery.** The NATS client re-dials in the background as soon as it
+notices the loss, with exponential backoff (100 ms doubling up to 10 s, with jitter) and up to
+`max_reconnect_attempts` times per recovery (the client's default is 10), replays its subscriptions and flushes
+the frames it buffered meanwhile. The transport steps back from recovering the connection itself:
+
+```yaml
+options:
+  reconnect: true             # the client recovers a lost connection (default: false)
+  max_reconnect_attempts: 20  # attempts per recovery (default: null = the client's default of 10)
+```
+
+In a DSN: `?reconnect=true&max_reconnect_attempts=20`.
+
+- A client in the middle of its recovery is left alone: no PING, no dial of the transport's own. The
+  operation waits for the recovery within its own budget: a request (`send()`, an `ack_sync` ACK, `setup()`,
+  `getMessageCount()`) within `request_timeout`, a pull within `max_batch_timeout` plus one second, after
+  which it ends empty. The budget is per request, not per method: `setup()` makes three or more requests, a
+  publish retries a missing responder three times on its own, and the first dial of a process is not bounded
+  by it at all.
+- The PING check of [Losing the Connection](#losing-the-connection) still runs, and when the PING fails, what
+  the client made of the connection decides. A client that is recovering, or that already recovered (its
+  reconnect count moved, so the PONG belonged to the lost connection), keeps its connection. A client that
+  still reports the same connection open is replaced, as without the option: nothing in the client recovers
+  a connection it does not know to be lost before its heartbeat has gone unanswered three times, about 90 s at
+  the client's defaults, and the heartbeat only runs while an operation holds the event loop. A client that
+  gave up is Closed and dialled again. A PHP process runs the event loop only inside a transport call, so the
+  client notices a lost connection when an operation writes to it or when this check runs: a `ping_after_idle`
+  shorter than the quiet periods between operations makes the first operation after one check first and go out
+  on the recovered connection, where without the check it writes into the dead socket, waits `request_timeout`
+  and fails, and only the next operation goes out.
+- With `auto_setup`, provisioning is verified again once the client reconnected, because the stream may have
+  gone with the server (a memory stream over a restart, a failover to a server without it). A send begun while
+  the client was recovering can still land on a server without the stream; when its publish fails with the
+  client's 503 "No JetStream responder", `setup()` runs once and the same frame is published once more, then a
+  second failure propagates. Nothing answered the first publish, so the second cannot duplicate it.
+- When the recovery gives up, the client is Closed and the acknowledgements it buffered during the outage are
+  discarded; the messages come back after `ack_wait`, counting one delivery against `max_deliver`. The client
+  reports the discard at error level through the logger the bundle gives it (`Reconnect exhausted: N bytes of
+  buffered publishes were discarded`, under Monolog's `messenger` channel). The next operation dials again,
+  and with the option on that dial runs the client's attempt loop inside the operation. Exhaustion propagates
+  as the client's `ConnectionException` ("Reconnect attempts exhausted") rather than being flattened into an
+  empty queue, so a worker ends and its supervisor restarts it. The same loop runs for a failed first dial, so
+  `messenger:setup-transports` against a server that is down fails only after it.
+- What a worker gets: it polls through an outage shorter than one recovery cycle without exiting, every pull
+  ending empty after `max_batch_timeout` plus a second. `max_reconnect_attempts` sizes the cycle in attempts,
+  not in seconds: the client's default of 10 gives about 109 s against a server that refuses connections,
+  where a refused dial costs about 6 s. An `ack_sync` acknowledgement that runs into the outage still fails
+  after `request_timeout`, which ends the worker's run as any exception from `ack()` does: synchronous
+  acknowledgement keeps its meaning.
+- An ACK, NAK or TERM written during a recovery is buffered by the client, and `ack()` or `reject()` returns at
+  once. That holds too when its own write is the first to notice the lost connection while the client still
+  reports it open: the write starts the recovery, and the frame goes out on the connection the recovery makes.
+  Before client 2.27.1, which the transport requires since 5.7.1, such a write ran the recovery inline, so one
+  `ack()` or `reject()` could wait for a whole attempt loop
+  ([client issue #244](https://github.com/ideaconnect/php-nats-jetstream-client/issues/244)). `keepalive()` only
+  queues its frame, as it must inside a signal handler, and never waits, PINGs or dials.
+- A server that stops gracefully ends every pull in flight with `409 Server Shutdown`, and a consumer whose
+  leader moved ends them with `409 Leadership Change`. Both are empty batches, in either mode, and no longer
+  read as a missing consumer; after a shutdown the next operation checks the connection first.
+
+Measured on nats-server 2.14.2 with client 2.27.0 and PHP 8.5, `request_timeout` 10, `connection_timeout` 1,
+`max_batch_timeout` 1, `auto_setup` with a memory stream, the server stopped with `docker stop` for about 53 s
+and the same transport object throughout. A refused dial on localhost costs about 6 s:
+
+| Operation while the server is down | `max_reconnect_attempts` 10 (the client's default) | `max_reconnect_attempts` 2 |
+|---|---|---|
+| `send()` in flight at the stop | 10.0 s, `TimeoutException` | 10.0 s, `TimeoutException` |
+| next `send()` | 10.0 s, `TimeoutException` (the client is still recovering) | 2.4 s, `Reconnect attempts exhausted` (the recovery gave up inside the wait) |
+| `get()` | 2.0 s, empty | 18.4 s, `Reconnect attempts exhausted` |
+| plain `ack()` | 0.00 s, buffered | 18.4 s, `Reconnect attempts exhausted` |
+| `getMessageCount()` | 20.0 s (two requests), 0 | 18.4 s, 0 |
+| `send()` after those | 10.0 s, `TimeoutException` | 18.4 s, `Reconnect attempts exhausted` |
+| first `send()` once the server is back | 2.8 s, stored; the memory stream recreated | 0.13 s, stored; the memory stream recreated |
+
+With 10 attempts the recovery cycle outlasted the outage, so every operation waited within its own budget
+and none dialled; once the server was back, the first send waited for the client's next attempt, at the 10 s
+cap of the backoff by then. With 2 attempts the client gave up about 12 s into the outage, and from then on
+every operation dialled inline, one dial and two attempts, and failed with the client's exception. Before
+this mode existed in the transport, the option as first proposed ran the whole attempt loop inside every
+operation during an outage, 109 s each at the defaults. The figures are measurements, not bounds: the option
+bounds attempts per recovery, not time, and a process can run any number of recovery cycles over its life.
+
+**When to enable:** long-running workers where a restart is expensive, against a NATS cluster whose nodes
+restart or fail over (see [Losing a Server](#losing-a-server)). Not for web requests that dispatch: a
+request handler stalls for a whole attempt loop when it runs into an outage once the client gave up. Leave
+it off to rely on the process supervisor and Symfony's retries, and to have `messenger:setup-transports`
+fail fast when NATS is unreachable.
+
+> **Tested by:** `testBuildTurnsClientReconnectAndPedanticModeOff`, `testBuildWithReconnectOptionsPropagatesToNatsOptions`, `testBuildWithReconnectFromDsnQueryString`, `testBuildKeepsTheClientReconnectAttemptDefaultWhenOnlyReconnectIsEnabled`, `testBuildWithInvalidMaxReconnectAttemptsThrowsException`, `testBuildPassesTheLoggerToTheClientAndNoneByDefault`, `testReconnectModeLeavesAClientInTheMiddleOfItsRecoveryAlone`, `testReconnectModeReadsAFailedPingAgainstTheClientsRecovery`, `testReconnectModeTakesARecoveredConnectionAsChecked`, `testWithoutReconnectAFailedPingReplacesTheConnectionAndTheReconnectCountIsNeverRead`, `testReconnectModeVerifiesProvisioningAgainAfterTheClientReconnected`, `testReconnectModeReprovisionsOnceWhenTheFirstPublishAfterTheReconnectFindsNoResponder`, `testReconnectModeDoesNotRetryAPublishOutsideTheNoResponderCase`, `testAPullTheServerEndedForItsShutdownIsEmptyAndTheNextOperationChecksTheConnection`, `testAPullEndedByALeadershipChangeIsEmptyAndTheNextOneDoesNotCheckTheConnection`, `testA409ReportingAConfigurationErrorStaysVisible`, `theBundleHandsTheApplicationsLoggerToTheFactory`, `testAnAcknowledgementWhoseWriteFindsTheConnectionLostReturnsAtOnceAndTheRecoverySendsIt`, the real-client tests in `tests/unit/ReconnectModeTest.php`, and the Behat scenarios `A worker keeps consuming across a server restart` and `A message sent after a server restart goes out on the reconnected connection and the memory stream is recreated`; the examples `reconnect.php` and `cluster-failover.php` (a failover in a three-server cluster)
 
 ## Stream Configuration
 
@@ -593,7 +990,203 @@ options:
   stream_replicas: 3
 ```
 
-> **Tested by:** `testReadmeStreamRetentionExamplesAreAccepted` (replicas 1 and 3), `testSetupPassesConfiguredStreamOptions`
+More than one replica needs a JetStream cluster: a standalone server refuses to create such a stream. Left
+unset, `stream_replicas` gives a new stream one replica and leaves the count of an existing stream alone, so
+a stream scaled up in NATS is not scaled back down by the next `setup()`. See
+[Using a NATS Cluster](#using-a-nats-cluster).
+
+> **Tested by:** `testReadmeStreamRetentionExamplesAreAccepted` (replicas 1 and 3), `testSetupPassesConfiguredStreamOptions`, `testSetupPreservesExistingReplicaCountWhenStreamReplicasNotConfigured`, `testSetupOverridesExistingReplicaCountWhenStreamReplicasExplicitlyConfigured`
+
+### Stream Placement
+
+In a JetStream cluster you can pin a stream to a named cluster and/or to the servers that carry specific
+tags (`server_tags` in the NATS server configuration). A stream is only placed on servers carrying
+**all** of the listed tags:
+
+```yaml
+options:
+  # Only on servers tagged both "ssd" and "eu-west"
+  stream_placement_tags: ['ssd', 'eu-west']
+
+  # In the "east" cluster of a super-cluster
+  stream_placement_cluster: 'east'
+
+  # Both at once
+  stream_placement_cluster: 'east'
+  stream_placement_tags: ['ssd']
+```
+
+In a DSN the tags are a comma-separated list: `?stream_placement_tags=ssd,eu-west`.
+
+> **Tested by:** `testBuildAcceptsStreamPlacementOptions`, `testBuildSplitsCommaSeparatedStreamPlacementTags`, `testBuildParsesStreamPlacementFromDsnQueryString`, `testSetupPassesStreamPlacementOnCreate`, `testSetupUpdateAppliesConfiguredStreamPlacementToAnExistingStream`, `testSetupUpdatePreservesServerStreamPlacementWhenNotConfigured`, `testSetupUpdateMergesConfiguredPlacementIntoTheLivePlacement`, `testSetupExplainsHowToStageAMoveAndScaleRejection`, `testAutoSetupRepeatsARejectedMoveAndScaleUpdateOnEverySend`, Behat scenarios in `nats_stream_placement.feature`, and the example `stream-placement.php` on a three-server cluster
+
+- Both options default to `null`, which leaves the stream's placement untouched: a new stream gets the
+  server's default placement and an existing stream keeps whatever placement it already has. This
+  matters because a JetStream update that omits `placement` clears it, so the transport echoes the live
+  value back whenever the options are unset.
+- On an existing stream each option replaces its own field of the live placement and nothing else:
+  `stream_placement_tags` replaces the tag list and keeps a cluster pin set in NATS, and
+  `stream_placement_cluster` replaces the cluster and keeps the live tags. Neither option can clear the
+  other field, so to remove a placement, or one half of it, change it in NATS directly.
+- nats-server compares the stored placement with the new one field by field and treats any difference as
+  a request to place the replicas again, even when the servers they are on already satisfy the new
+  constraints, and even when only the order of the tags changed. The transport therefore keeps the live
+  tag list as the server stores it whenever the configured tags name the same set, and compares the tags
+  exactly: `SSD` and `ssd` match the same servers, but the server's `unique_tag` bypass (below) is
+  case-sensitive, so a tag that differs only in case is sent as a change. The server accepts a new
+  placement at once and `setup()` returns; the replica migration runs in the background (`nats stream
+  info` shows the replicas as not current until it finishes).
+- In a super-cluster a placement that names tags but no cluster is resolved in the cluster the client
+  running `setup()` is connected to, then in the clusters that one lists as alternates, on create and on
+  a move alike. A tags-only change can therefore relocate the stream to another cluster. Set
+  `stream_placement_cluster` to keep the stream where it is: the transport does not fill the cluster in
+  from the live stream, because a pin it made up would show in `nats stream info` as configuration nobody
+  asked for, and the options could never clear it again.
+- NATS refuses to change the placement and `stream_replicas` in the same update (err_code 10123), and
+  `setup()` fails with the server's message and the staging steps. Stage the two changes: run
+  `messenger:setup-transports` with only one of them (for example the placement options as they were and
+  the new `stream_replicas`), wait until `nats stream info` shows every replica as current, then run it
+  again with the other change. Running the same combined configuration twice is not staging. With
+  `auto_setup: true` the transport runs `setup()` before the first `send()` or `get()` of a process, so
+  every one of them repeats the rejected update and fails until the configuration is staged; nothing is
+  published or consumed meanwhile. The transport does not split the update itself, because a `setup()`
+  that applied one half and returned would count as done and the other half would never be applied.
+- **Exclusion tags and the `unique_tag` bypass (NATS 2.12+).** A tag prefixed with `!` excludes the
+  servers that carry it, for example `!disk:hdd`. The server strips the `!` before it looks at the
+  cluster's `unique_tag` setting, and any placement tag that starts with that configured prefix switches
+  the uniqueness constraint **off** for the stream (nats-server's own comment: "disable uniqueness check
+  if explicitly listed in tags"). So with `unique_tag: "zone:"`, the tag `!zone:ignore` excludes nobody
+  and only lifts the requirement that replicas sit in distinct zones, which lets a 3-replica stream be
+  created on a cluster with fewer than 3 zones. A positive tag that every server carries and that starts
+  with the prefix, such as `zone:any` added to each server's `server_tags`, has the same effect on any
+  server version. On 2.11 and older the `!` is not stripped, so `!zone:ignore` is a mandatory tag nothing
+  matches and creation fails with `tags not matched`.
+- On a clustered server, tags that no server carries make stream creation fail with a JetStream error such
+  as `no suitable peers for placement`. A standalone (non-clustered) server accepts and stores any
+  placement without acting on it.
+
+Taking an existing single-replica stream to three replicas on `ssd` servers, in two stages:
+
+```yaml
+# Stage 1: the replica count alone. The placement options stay as they were (here unset, so the live
+# placement is echoed back). Run messenger:setup-transports, then wait until `nats stream info` shows
+# every replica as current.
+options:
+  stream_replicas: 3
+```
+
+```yaml
+# Stage 2: the placement. Run messenger:setup-transports again.
+options:
+  stream_replicas: 3
+  stream_placement_tags: ['ssd']
+```
+
+## Using a NATS Cluster
+
+The transport runs against a NATS cluster as it runs against a single server. A cluster changes how a process
+finds the servers, what happens when the one it is connected to goes away, and how many servers a stream lives
+on. Two examples show it on the three-server JetStream cluster `composer nats:start` runs next to the test
+servers ([`examples/README.md`](examples/README.md#the-test-cluster) describes it):
+[`cluster-failover.php`](examples/cluster-failover.php) stops the server a worker is connected to, and the
+worker carries on through another one; [`stream-placement.php`](examples/stream-placement.php) places a
+stream's replicas on tagged servers and stages a move.
+
+```yaml
+framework:
+  messenger:
+    transports:
+      nats_transport:
+        # One server of the cluster, or a name that resolves to several; the client learns the others from it.
+        dsn: 'nats-jetstream+tls://nats.internal:4222/orders/orders.created'
+        options:
+          stream_replicas: 3            # the stream outlives the loss of one server
+          reconnect: true               # a worker fails over to another server instead of exiting
+          max_reconnect_attempts: 20
+          tls_required: true            # TLS for the servers learned from the cluster as well
+          tls_ca_file: '/etc/nats/ca.pem'
+```
+
+> **Tested by:** `testReadmeDsnExamplesParseSuccessfully[README: cluster transport]`, `testReadmeClusterOptionsAreAccepted`, the examples `cluster-failover.php` and `stream-placement.php` (CI runs both on the test cluster)
+
+### Finding the Servers
+
+The DSN names one server. Once connected, the NATS client learns the other servers of the cluster from it (the
+`connect_urls` the server sends) and keeps them for its later dials. What it learns is the address each server
+advertises, so behind NAT, in Docker or in Kubernetes set `client_advertise` in every server's configuration to
+an address the application reaches that server on, as the test cluster does. A cluster that advertises nothing
+(`no_advertise`) leaves the client with the DSN's server alone.
+
+Until it has connected once, a process knows only the server its DSN names, and so does every PHP-FPM request
+that dispatches, since each one builds its transport anew. One that starts while that server is down cannot
+connect, whichever servers of the cluster are up: it fails after one dial, about 6 s against a refused port, or
+with `reconnect: true` after the client's whole attempt loop over that one server. Point the DSN at a name
+that resolves to several servers of the cluster (the dial tries each address it resolves to in turn), or at a
+load balancer or a Kubernetes Service in front of the cluster.
+
+### Losing a Server
+
+What a process does when the server it is connected to goes away depends on
+[`reconnect`](#automatic-reconnect):
+
+- **`reconnect: false` (the default):** the operation that runs into the lost connection fails, and the next
+  one dials the next server in the client's list, learned ones included; a server there that is down as well
+  costs that operation a failed dial, and the one after it tries the next. A process that keeps running, such
+  as a long-lived sender, carries on through another server. A consumer worker exits on the failed `get()`,
+  though, and the worker its supervisor starts knows only the DSN's server again (see above).
+- **`reconnect: true`:** the client recovers the connection in the background on a server it learned, and a
+  worker polls on. `cluster-failover.php` stops the server a worker is connected to halfway through its
+  messages: the worker receives the rest through another server, without an exception.
+
+Measured on the test cluster (nats-server 2.15.1, client 2.27.2, PHP 8.5), a stream with three replicas, the
+DSN on the server that leads it, that server stopped with `docker stop`, `request_timeout` 10 and
+`max_reconnect_attempts` 2 (for the pause, `ping_after_idle` 1 and 2 s), one transport object throughout:
+
+| | `reconnect: false` | `reconnect: true` |
+|---|---|---|
+| first `send()`, right after the stop | fails at once, `Reconnect is disabled` | 10.0 s, `TimeoutException`; the client is on another server by then |
+| first `send()`, after a pause longer than `ping_after_idle` | stored at once, through another server | stored at once, through another server |
+| next `send()` | stored at once, through another server | stored at once, through another server |
+| a new transport whose DSN names the stopped server | 6.0 s, connection refused | 18.4 s, `Reconnect attempts exhausted` |
+
+Right after the stop, the first send ran into the lost connection: with the option off the client reported the
+loss at once, with it on the send went into the dead connection before the client noticed and waited for a
+reply that never came. After a pause longer than `ping_after_idle` the check that runs first finds the
+connection gone, in either mode, and the send goes out through another server (see
+[Losing the Connection](#losing-the-connection)). Whether a send that failed was stored is unknown either way
+(see [Duplicate Protection](#duplicate-protection)).
+
+### Streams on a Cluster
+
+- **Replicas.** A stream with one replica lives on one server and is unavailable while that server is down.
+  With `stream_replicas: 3` it outlives the loss of one server, with 5 the loss of two. The durable consumer
+  the transport creates takes the stream's replica count. Left unset, the option gives a new stream one replica
+  and leaves an existing stream's count alone (see [High Availability](#high-availability)).
+- **Placement.** `stream_placement_tags` and `stream_placement_cluster` choose the servers, and in a
+  super-cluster the cluster, that hold the replicas. A change of the replica count and of the placement has to
+  be staged in two runs of `messenger:setup-transports`. See [Stream Placement](#stream-placement).
+- **Provisioning.** `messenger:setup-transports` can run through any server of the cluster. In a super-cluster
+  a stream without `stream_placement_cluster` is created in the cluster that server belongs to, or in one of
+  its alternates.
+- **Leader changes.** A pull that ends because the consumer's leader moved (`409 Leadership Change`) is an
+  empty batch in either mode, and the worker pulls on.
+
+### TLS on a Cluster
+
+The `nats-jetstream+tls://` scheme turns TLS on for the server the DSN names. The servers the client learns
+from the cluster are dialled with TLS only when `tls_required: true` is set as well. Without it, a server that
+requires TLS refuses the client (`TLS upgrade requested but no TLS context was configured at connect time`), so
+no failover succeeds, in either mode, and a server that also accepts plain connections would receive the
+credentials unencrypted. Set both, as the example above does.
+
+Each dial checks the server's certificate against the host it dialled: the DSN's host for the first dial, the
+address a learned server advertises (`client_advertise`) for the others. Issue each server's certificate for
+those names, or set `tls_peer_name` to a name every server's certificate carries.
+
+> **Checked by hand** on a two-server TLS cluster (nats-server 2.15.1, client 2.27.2): with the `+tls` scheme
+> alone, every dial of the second server failed once the first one stopped, with `reconnect` off and on; with
+> `tls_required: true` the next dial reached it. A server advertising a name its certificate does not carry was
+> refused (`Peer certificate CN=... did not match expected CN=...`) until `tls_peer_name` named one it carries.
 
 ## Testing
 
@@ -633,12 +1226,18 @@ actually detect behavioral changes (not just execute lines):
 
 ```bash
 # Requires a coverage driver (xdebug or pcov)
+composer test:mutation:canary     # mutants that change nothing must all escape
 composer test:mutation
+composer test:mutation:check-log  # no mutant may be killed by the test harness instead of a test
 ```
 
 Configuration lives in `infection.json5`. It enforces a minimum MSI of 90% and a minimum covered MSI of
-95%; the suite currently scores 100% covered MSI with 100% mutation code coverage. CI runs it on the
-PHP 8.5 job.
+95%; the suite scores 96.9% (1008 of 1040 mutants killed, with 100% mutation code coverage).
+[docs/TESTS.md](docs/TESTS.md#surviving-mutants) lists the 32 mutants that survive, with the reason for each:
+27 are equivalent, three make no difference with the real client, and two differ about once in a million
+runs. CI runs all three on the PHP 8.5 job and every day. Scores published before, 100% among them, were not
+real: in Infection's mutant processes the client's final classes could not be doubled, so every mutant their
+tests covered counted as killed.
 
 ### Functional Tests
 
@@ -648,7 +1247,8 @@ Functional tests require a running NATS server with JetStream enabled:
 # Set up functional test dependencies
 composer test:functional:setup
 
-# Start NATS server in Docker
+# Start the NATS test servers in Docker, with the three-server cluster the examples use (generates the test
+# TLS certificates first, which needs openssl)
 composer nats:start
 
 # Run functional tests
@@ -660,6 +1260,9 @@ composer nats:stop
 
 **Manual approach:**
 ```bash
+# Generate the test TLS certificates the TLS and mTLS servers use (never committed)
+bash tests/nats/certs/generate.sh
+
 # Set up NATS in Docker (optional)
 cd tests/nats
 docker-compose up -d
@@ -767,6 +1370,12 @@ framework:
 symfony console messenger:setup-transports nats_transport
 ```
 
+This will:
+1. Create the stream with the configured settings, or update an existing one (merging subjects and keeping
+   the server's own fields)
+2. Create the consumer with an explicit ACK policy
+3. Verify that the consumer matches the configuration
+
 **Automatic (`auto_setup`).** Set `auto_setup=true` to have the transport provision the stream and
 consumer itself, lazily, on the first `send()`/`get()`. Setup then runs once per transport instance, and
 again only if JetStream reports the stream or consumer as missing during a pull (for example after NATS
@@ -799,6 +1408,13 @@ framework:
 > deleting the stream deletes its consumers with it, so the pull fails with status 503 (nothing is left
 > to answer it), which is one of the statuses that trigger re-provisioning.
 
+> **Note on a server that stops:** a pull the server ended for its own shutdown (`409 Server Shutdown`) or
+> for a leadership change (`409 Leadership Change`) is an empty batch, in either mode, and not one of the
+> statuses that trigger re-provisioning: with `auto_setup` the transport does not run `setup()` against a
+> server that is going away. After a shutdown the next operation checks the connection first. Every other
+> 409, `Consumer Deleted` among them, still triggers one re-provisioning attempt, and the 409s that report
+> configuration (`Consumer is push based`, `Exceeded MaxRequestBatch`) still propagate.
+
 > **Note on `replay_policy`:** the replay policy of a durable consumer is fixed when the consumer is
 > created. NATS rejects an update that changes it, in both directions: once a consumer exists as
 > `original`, removing the option again does not restore `instant` either, because the server reads the
@@ -819,7 +1435,15 @@ framework:
 > already-created stream works on NATS 2.12 and newer, and is rejected by the server on older versions -
 > recreate the stream to change it there.
 
-> **Tested by:** `testSetupCreatesStreamAndConsumer`, `testSetupPassesConfiguredStreamOptions`, `testSetupPassesNewStreamPolicyOptions`, `testSetupPassesNewConsumerOptions`, `testAutoSetupProvisionsOnFirstSendOnce`, `testAutoSetupProvisionsOnFirstGet`, `testAutoSetupDisabledByDefaultDoesNotProvisionOnSend`, `testSetupUpdatesExistingStreamMergesSubjectsAndPreservesServerConfig`, Behat scenarios `Setup NATS stream with max age configuration`, `Setup command handles existing streams gracefully`, and `Custom consumer name is registered in JetStream`
+> **Note on placement:** `stream_placement_cluster` and `stream_placement_tags` follow the same rule as
+> `stream_max_consumers`: they are written only when you set them, and unset options leave the stream's
+> existing placement in place. A JetStream update that omits `placement` would clear it, so the transport
+> echoes the live value back whenever the options are unset, and a set option replaces only its own field
+> of the live placement. NATS rejects a placement change combined with a `stream_replicas` change on an
+> existing stream, and with `auto_setup` every `send()` and `get()` repeats that rejected update until the
+> two are staged. See [Stream Placement](#stream-placement) for the steps.
+
+> **Tested by:** `testSetupCreatesStreamAndConsumer`, `testSetupPassesConfiguredStreamOptions`, `testSetupPassesNewStreamPolicyOptions`, `testSetupPassesNewConsumerOptions`, `testSetupPassesStreamPlacementOnCreate`, `testSetupUpdateAppliesConfiguredStreamPlacementToAnExistingStream`, `testSetupUpdatePreservesServerStreamPlacementWhenNotConfigured`, `testAutoSetupProvisionsOnFirstSendOnce`, `testAutoSetupProvisionsOnFirstGet`, `testAutoSetupDisabledByDefaultDoesNotProvisionOnSend`, `testSetupUpdatesExistingStreamMergesSubjectsAndPreservesServerConfig`, Behat scenarios `Setup NATS stream with max age configuration`, `Setup command handles existing streams gracefully`, and `Custom consumer name is registered in JetStream`
 
 ### Delayed / Scheduled Messages
 
@@ -859,12 +1483,7 @@ resolution**. The delay is rounded **up** to the next whole second, so a message
 *before* the requested delay elapses (it may arrive up to ~1 second later); a sub-second delay therefore
 schedules at the next whole second rather than firing immediately.
 
-When `scheduled_messages` is disabled (the default), any `DelayStamp` on the envelope is silently ignored and messages are published immediately.
-
-This will:
-1. Create the stream with configured settings
-2. Create the consumer with explicit ACK policy
-3. Verify consumer creation
+When `scheduled_messages` is disabled (the default), any `DelayStamp` on the envelope is silently ignored and messages are published immediately. That includes the `DelayStamp` Symfony's retry adds, so retries run back to back (see [Retry Handler Behavior](#retry-handler-behavior)).
 
 ### Stream Monitoring
 
@@ -902,7 +1521,12 @@ if ($count > 0) {
 }
 ```
 
-> **Tested by:** `testGetMessageCountReturnsConsumerPendingMessages`, `testGetMessageCountFallsBackToStreamState`, `testGetMessageCountReturnsZeroWhenLookupsFail`, `testGetMessageCountSumsAckPendingAndPending`
+`getMessageCount()`, which `messenger:stats` shows, returns 0 when NATS cannot be reached, the same as for an
+empty queue, so during an outage the queue reads as empty there. It gives up after a single connection attempt
+(about 6 seconds for a refused connection, see [Connection Timeout](#connection-timeout)). Monitor the
+connection itself, or the stream with the `nats` CLI, rather than reading a 0 as "nothing to do".
+
+> **Tested by:** `testGetMessageCountReturnsConsumerPendingMessages`, `testGetMessageCountFallsBackToStreamState`, `testGetMessageCountReturnsZeroWhenLookupsFail`, `testGetMessageCountSumsAckPendingAndPending`, `testMessageCountThatCannotConnectDialsOnceAndReturnsZero`
 
 ## Troubleshooting
 
@@ -927,6 +1551,35 @@ symfony console messenger:setup-transports nats_transport
 
 > **Tested by:** `testSetupCreatesStreamAndConsumer`, `testSetupUpdatesStreamWhenItAlreadyExists`, Behat scenarios `Setup NATS stream with max age configuration` and `Setup command handles existing streams gracefully`
 
+**Error: "Cannot pull from NATS stream ...: the subscription limit was exceeded"**
+
+The connection may hold only one subscription, and the transport needs two. Raise the server's `max_subscriptions`,
+or the account's or user's subscription limit, to at least two (see [Subscription Limits](#subscription-limits)).
+
+> **Tested by:** `testAtALimitOfOneThePullFailsWithATransportExceptionNamingTheLimit`, `testAtALimitOfTwoPullsDeliverAndAcknowledge`
+
+**Error: "Reconnect attempts exhausted"**
+
+With [`reconnect: true`](#automatic-reconnect) the client's recovery of a lost connection gave up after
+`max_reconnect_attempts`, and the operation that reports it ran the client's attempt loop inside the call. The
+outage outlasted one recovery cycle: raise `max_reconnect_attempts` for longer outages (the client's default of
+10 covers about 109 s against a server that refuses connections), or leave the option off to fail fast and let
+the process supervisor restart the worker. The logger shows the attempts at warning level and, when
+acknowledgements were buffered during the outage, the discard at error level (see [Logging](#logging)).
+
+> **Tested by:** `testAReconnectThatGivesUpWithABufferedAcknowledgementIsReportedToTheLoggerAndTheNextOperationFails`
+
+**Error: "TLS upgrade requested but no TLS context was configured at connect time"**
+
+On a cluster that requires TLS, the client dialled a server it learned from the cluster without TLS, because
+only the `nats-jetstream+tls://` scheme asked for it. Set `tls_required: true` as well (see
+[TLS on a Cluster](#tls-on-a-cluster)).
+
+**Error: "replicas > 1 not supported in non-clustered mode"**
+
+`stream_replicas` above 1 needs a JetStream cluster; on a standalone server leave it at 1 (see
+[High Availability](#high-availability)).
+
 ### Message Processing Issues
 
 **Messages not being consumed**
@@ -950,16 +1603,22 @@ nats consumer info my-stream my-consumer --json | jq '.state'
 
 ## Architecture
 
-The bridge consists of two main components:
+The bridge consists of two main components, wired into the framework by a thin bundle:
+
+### IDCTNatsMessengerBundle
+- Registers `NatsTransportFactory` and the `IgbinarySerializer` service in the application container
+- Hands the application's `logger` service to the factory, under Monolog's `messenger` channel
+- Auto-enabled by Symfony Flex; no semantic configuration
 
 ### NatsTransportFactory
 - Handles DSN scheme detection (`nats-jetstream://`)
-- Creates `NatsTransport` instances
+- Creates `NatsTransport` instances, handing them its optional PSR-3 logger for the NATS client
 - Validates configuration
 
 ### NatsTransport
-- Implements Symfony's `TransportInterface`, `MessageCountAwareInterface`, and `SetupableTransportInterface`
-- Manages stream and consumer connections
+- Implements Symfony's `TransportInterface`, `MessageCountAwareInterface`, `SetupableTransportInterface`, `KeepaliveReceiverInterface`, and `CloseableTransportInterface`
+- Manages stream and consumer connections: dials again itself after a lost connection, or leaves the recovery to
+  the NATS client with `reconnect: true`
 - Handles message serialization via a pluggable `SerializerInterface` (igbinary when constructed directly without one)
 - Supports batching and explicit acknowledgment
 
@@ -978,7 +1637,7 @@ The bridge consists of two main components:
 
 3. **Use appropriate replicas**
    - `stream_replicas: 1` for development
-   - `stream_replicas: 3` for production
+   - `stream_replicas: 3` for production, on a JetStream cluster (see [Using a NATS Cluster](#using-a-nats-cluster))
 
 4. **Monitor performance**
    - Use `getMessageCount()` to track queue depth

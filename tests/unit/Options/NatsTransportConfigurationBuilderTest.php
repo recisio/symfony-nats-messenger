@@ -9,6 +9,7 @@ use IDCT\NATS\JetStream\Enum\ReplayPolicy;
 use IDCT\NATS\JetStream\Enum\RetentionPolicy;
 use IDCT\NatsMessenger\Options\NatsTransportConfiguration;
 use IDCT\NatsMessenger\Options\NatsTransportConfigurationBuilder;
+use IDCT\NatsMessenger\Tests\Support\RecordingLogger;
 use IDCT\NatsMessenger\Options\RetryHandler;
 use IDCT\NatsMessenger\Options\StreamCompression;
 use IDCT\NatsMessenger\Options\TransportOption;
@@ -141,6 +142,13 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         self::assertSame(42, $configuration->streamMaxMessagesPerSubject());
     }
 
+    public function testBuildAcceptsStreamStorageInAnyCase(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['stream_storage' => 'Memory']);
+
+        self::assertSame('memory', $configuration->streamStorage()->value);
+    }
+
     public function testBuildMethodOptionsOverrideQueryForStreamStorageAndPerSubjectLimit(): void
     {
         $configuration = (new NatsTransportConfigurationBuilder())->build(
@@ -165,6 +173,23 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         $options = $this->extractNatsOptions($configuration->client);
 
         self::assertStringStartsWith('tls://', $options->servers[0]);
+    }
+
+    /**
+     * URI schemes are case-insensitive, so an upper-case +tls scheme still selects TLS.
+     */
+    public function testBuildRecognizesTheTlsSchemeInAnyCase(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build('NATS-JETSTREAM+TLS://localhost:4222/test-stream/test-topic');
+
+        self::assertSame('tls://localhost:4222', $this->extractNatsOptions($configuration->client)->servers[0]);
+    }
+
+    public function testBuildUsesThePortTheDsnGives(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build('nats://localhost:4333/test-stream/test-topic');
+
+        self::assertSame('nats://localhost:4333', $this->extractNatsOptions($configuration->client)->servers[0]);
     }
 
     public function testBuildWithTlsAndAuthOptionsPropagatesToNatsOptions(): void
@@ -261,6 +286,47 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         self::assertSame('  secret  ', $options->password);
     }
 
+    /**
+     * A credential option given as a number or a boolean, as YAML gives `password: 1234`, reaches the client
+     * as a string.
+     */
+    #[DataProvider('scalarCredentialValues')]
+    public function testBuildPassesScalarCredentialOptionsAsStrings(int|float|bool $value, string $expected): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['username' => $value, 'password' => $value]);
+
+        $options = $this->extractNatsOptions($configuration->client);
+
+        self::assertSame($expected, $options->username);
+        self::assertSame($expected, $options->password);
+    }
+
+    /**
+     * @return iterable<string, array{int|float|bool, string}>
+     */
+    public static function scalarCredentialValues(): iterable
+    {
+        yield 'int' => [1234, '1234'];
+        yield 'float' => [12.5, '12.5'];
+        yield 'true' => [true, '1'];
+    }
+
+    /**
+     * A credential option that is not a scalar is ignored, and the credentials in the DSN are used.
+     */
+    public function testBuildFallsBackToTheDsnCredentialsForNonScalarOptions(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(
+            self::VALID_DSN,
+            ['username' => ['someone-else'], 'password' => ['other-secret']]
+        );
+
+        $options = $this->extractNatsOptions($configuration->client);
+
+        self::assertSame('admin', $options->username);
+        self::assertSame('password', $options->password);
+    }
+
     public function testBuildNormalizesStringBooleanAndNullableStringOptions(): void
     {
         $configuration = (new NatsTransportConfigurationBuilder())->build(
@@ -327,6 +393,63 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         $options = $this->extractNatsOptions($configuration->client);
 
         self::assertFalse($options->tlsVerifyPeer);
+    }
+
+    /**
+     * Only a value that explicitly disables it turns TLS peer verification off. Any other value keeps the
+     * secure default, including one the coercion does not recognize and an empty one, which used to turn
+     * verification off without a word (#42).
+     */
+    #[DataProvider('tlsVerifyPeerValues')]
+    public function testTlsVerifyPeerStaysOnUnlessExplicitlyDisabled(mixed $value, bool $expected): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['tls_verify_peer' => $value]);
+
+        self::assertSame($expected, $this->extractNatsOptions($configuration->client)->tlsVerifyPeer);
+    }
+
+    /**
+     * @return iterable<string, array{mixed, bool}>
+     */
+    public static function tlsVerifyPeerValues(): iterable
+    {
+        foreach (['false', 'FALSE', '0', 'no', 'Off'] as $disabling) {
+            yield "'{$disabling}' disables it" => [$disabling, false];
+        }
+        yield 'false disables it' => [false, false];
+        yield '0 disables it' => [0, false];
+
+        foreach (['true', '1', 'yes', 'on', 'enabled', 'y', 'verify', ''] as $other) {
+            yield "'{$other}' keeps it on" => [$other, true];
+        }
+        yield 'true keeps it on' => [true, true];
+        yield '1 keeps it on' => [1, true];
+        yield 'null keeps it on' => [null, true];
+        yield 'a non-scalar keeps it on' => [[], true];
+    }
+
+    /**
+     * The same holds for a value given in the DSN query string, where an unset environment variable in a
+     * templated DSN leaves an empty one.
+     */
+    #[DataProvider('tlsVerifyPeerQueries')]
+    public function testTlsVerifyPeerInTheDsnStaysOnUnlessExplicitlyDisabled(string $query, bool $expected): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN . $query);
+
+        self::assertSame($expected, $this->extractNatsOptions($configuration->client)->tlsVerifyPeer);
+    }
+
+    /**
+     * @return iterable<string, array{string, bool}>
+     */
+    public static function tlsVerifyPeerQueries(): iterable
+    {
+        yield 'left out' => ['', true];
+        yield 'empty' => ['?tls_verify_peer=', true];
+        yield 'unrecognized' => ['?tls_verify_peer=enabled', true];
+        yield 'false' => ['?tls_verify_peer=false', false];
+        yield 'off' => ['?tls_verify_peer=off', false];
     }
 
     public function testBuildWithNonScalarOptionsCoerceToSafeDefaults(): void
@@ -413,6 +536,97 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         self::assertSame(2500, $options->connectTimeoutMs);
     }
 
+    /**
+     * A positive timeout below half a millisecond rounds to 0 ms, which the client refuses, so it is raised to
+     * 1 ms, like ack_wait and max_batch_timeout.
+     */
+    public function testBuildClampsSubMillisecondTimeoutsToOneMs(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, [
+            'connection_timeout' => 0.0004,
+            'request_timeout' => 0.0004,
+        ]);
+
+        $options = $this->extractNatsOptions($configuration->client);
+
+        self::assertSame(1, $options->connectTimeoutMs);
+        self::assertSame(1, $options->requestTimeoutMs);
+    }
+
+    /**
+     * A null timeout, which YAML gives for `~`, keeps the default instead of falling to the 1 ms floor.
+     */
+    public function testBuildUsesTheDefaultTimeoutsForNullOptions(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, [
+            'connection_timeout' => null,
+            'request_timeout' => null,
+        ]);
+
+        $options = $this->extractNatsOptions($configuration->client);
+
+        self::assertSame(1000, $options->connectTimeoutMs);
+        self::assertSame(10_000, $options->requestTimeoutMs);
+    }
+
+    /**
+     * Unless `reconnect` is on, the client runs with reconnect off, so that a lost connection leaves it Closed and
+     * the transport dials again itself; the attempt count stays the client's own default for when it is on, and
+     * pedantic protocol checks are off either way.
+     */
+    public function testBuildTurnsClientReconnectAndPedanticModeOff(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN);
+        $options = $this->extractNatsOptions($configuration->client);
+
+        self::assertFalse($configuration->isReconnectEnabled());
+        self::assertNull($configuration->maxReconnectAttempts());
+        self::assertFalse($options->reconnectEnabled);
+        self::assertSame((new NatsOptions())->maxReconnectAttempts, $options->maxReconnectAttempts);
+        self::assertFalse($options->pedantic);
+    }
+
+    /**
+     * Before request_timeout existed, every request waited the client's default of 10 seconds (#51).
+     */
+    public function testRequestTimeoutDefaultsToTenSeconds(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN);
+
+        self::assertSame(10_000, $this->extractNatsOptions($configuration->client)->requestTimeoutMs);
+    }
+
+    /**
+     * Seconds, fractions kept, from the options and from the DSN query, the options winning (#51).
+     */
+    public function testBuildWithRequestTimeoutPropagatesMs(): void
+    {
+        $builder = new NatsTransportConfigurationBuilder();
+
+        self::assertSame(2500, $this->extractNatsOptions($builder->build(self::VALID_DSN, ['request_timeout' => 2.5])->client)->requestTimeoutMs);
+        self::assertSame(30_000, $this->extractNatsOptions($builder->build(self::VALID_DSN . '?request_timeout=30')->client)->requestTimeoutMs);
+        self::assertSame(45_000, $this->extractNatsOptions($builder->build(self::VALID_DSN . '?request_timeout=30', ['request_timeout' => 45])->client)->requestTimeoutMs);
+    }
+
+    #[DataProvider('invalidRequestTimeoutValues')]
+    public function testBuildWithInvalidRequestTimeoutThrowsException(mixed $value): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('request_timeout');
+
+        (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['request_timeout' => $value]);
+    }
+
+    /**
+     * @return iterable<string, array{mixed}>
+     */
+    public static function invalidRequestTimeoutValues(): iterable
+    {
+        yield 'zero' => [0];
+        yield 'negative' => [-1];
+        yield 'non-numeric' => ['soon'];
+    }
+
     private function extractNatsOptions(NatsClient $client): NatsOptions
     {
         $clientReflection = new \ReflectionClass($client);
@@ -497,11 +711,23 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         yield 'non-numeric' => ['soon'];
     }
 
+    /**
+     * Off unless asked for, from the options or from the DSN query (#53).
+     */
+    public function testDeduplicateIsOffByDefaultAndCanBeEnabled(): void
+    {
+        $builder = new NatsTransportConfigurationBuilder();
+
+        self::assertFalse($builder->build(self::VALID_DSN)->isDeduplicationEnabled());
+        self::assertTrue($builder->build(self::VALID_DSN, ['deduplicate' => true])->isDeduplicationEnabled());
+        self::assertTrue($builder->build(self::VALID_DSN . '?deduplicate=true')->isDeduplicationEnabled());
+        self::assertFalse($builder->build(self::VALID_DSN . '?deduplicate=true', ['deduplicate' => false])->isDeduplicationEnabled());
+    }
+
     public function testDefaultOptionsCoversAllTransportOptionCases(): void
     {
         $reflection = new \ReflectionClass(NatsTransportConfigurationBuilder::class);
-        $method = $reflection->getMethod('defaultOptions');
-        $defaultOptions = $method->invoke(null);
+        $defaultOptions = $reflection->getConstant('DEFAULT_OPTIONS');
 
         $enumValues = array_map(static fn (TransportOption $case): string => $case->value, TransportOption::cases());
 
@@ -711,6 +937,27 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
 
         self::assertSame([1000, 5000], $configuration->backoffMs());
         self::assertSame(2000, $configuration->nakDelayMs());
+    }
+
+    /**
+     * The backoff check takes any non-negative number of seconds: 0, and fractions given as floats or strings.
+     */
+    public function testBuildAcceptsZeroAndFractionalBackoffEntries(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['backoff' => [0, 0.5, '2.5']]);
+
+        self::assertSame([0, 500, 2500], $configuration->backoffMs());
+    }
+
+    /**
+     * max_deliver on its own, with no backoff schedule to compare it with, is accepted.
+     */
+    public function testBuildAcceptsMaxDeliverWithoutBackoff(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['max_deliver' => 3]);
+
+        self::assertSame(3, $configuration->maxDeliver());
+        self::assertNull($configuration->backoffMs());
     }
 
     public function testBuildWithDottedTopicNameSucceeds(): void
@@ -926,6 +1173,12 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
             'my-stream',
             'my-topic',
         ];
+
+        yield 'README: cluster transport' => [
+            'nats-jetstream+tls://nats.internal:4222/orders/orders.created',
+            'orders',
+            'orders.created',
+        ];
     }
 
     /**
@@ -942,6 +1195,10 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
                 'max_batch_timeout' => 1.0,
                 'connection_timeout' => 1.0,
                 'ping_after_idle' => 30,
+                'request_timeout' => 10,
+                'reconnect' => false,
+                'max_reconnect_attempts' => 10,
+                'deduplicate' => false,
                 'stream_max_age' => 86400,
                 'stream_max_bytes' => 1073741824,
                 'stream_max_messages' => 1000000,
@@ -950,6 +1207,8 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
                 'stream_max_consumers' => 10,
                 'stream_storage' => 'file',
                 'stream_replicas' => 1,
+                'stream_placement_cluster' => 'east',
+                'stream_placement_tags' => ['ssd', 'eu-west'],
                 'stream_retention' => 'limits',
                 'stream_discard' => 'old',
                 'stream_duplicate_window' => 120,
@@ -981,6 +1240,9 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         self::assertSame(10, $configuration->streamMaxConsumers());
         self::assertSame('file', $configuration->streamStorage()->value);
         self::assertSame(1, $configuration->streamReplicas());
+        self::assertSame(['cluster' => 'east', 'tags' => ['ssd', 'eu-west']], $configuration->streamPlacement());
+        self::assertFalse($configuration->isReconnectEnabled());
+        self::assertSame(10, $configuration->maxReconnectAttempts());
         self::assertSame('limits', $configuration->streamRetention()?->value);
         self::assertSame('old', $configuration->streamDiscard()?->value);
         self::assertSame(120, $configuration->streamDuplicateWindowSeconds());
@@ -1030,6 +1292,12 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         foreach ([1.0, 2.0, 3.0] as $timeout) {
             $configuration = $builder->build(self::VALID_DSN, ['connection_timeout' => $timeout]);
             self::assertNotNull($configuration, "connection_timeout {$timeout} should be accepted");
+        }
+
+        // request_timeout examples: 10 (the default) and 30
+        foreach ([[10, 10_000], [30, 30_000]] as [$timeout, $expectedMs]) {
+            $configuration = $builder->build(self::VALID_DSN, ['request_timeout' => $timeout]);
+            self::assertSame($expectedMs, $this->extractNatsOptions($configuration->client)->requestTimeoutMs, "request_timeout {$timeout} should produce {$expectedMs}ms");
         }
     }
 
@@ -1152,6 +1420,36 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         self::assertSame(3, $config->streamReplicas());
     }
 
+    /**
+     * Verifies the README "Using a NATS Cluster" example: one TLS server in the DSN, three replicas, the
+     * reconnect mode, and tls_required so that the servers learned from the cluster are dialled with TLS too.
+     */
+    public function testReadmeClusterOptionsAreAccepted(): void
+    {
+        $config = (new NatsTransportConfigurationBuilder())->build(
+            'nats-jetstream+tls://nats.internal:4222/orders/orders.created',
+            [
+                'stream_replicas' => 3,
+                'reconnect' => true,
+                'max_reconnect_attempts' => 20,
+                'tls_required' => true,
+                'tls_ca_file' => '/etc/nats/ca.pem',
+            ]
+        );
+        $options = $this->extractNatsOptions($config->client);
+
+        self::assertSame('orders', $config->streamName);
+        self::assertSame('orders.created', $config->topic);
+        self::assertSame(3, $config->streamReplicas());
+        self::assertTrue($config->isReconnectEnabled());
+        self::assertSame(20, $config->maxReconnectAttempts());
+        self::assertSame(['tls://nats.internal:4222'], $options->servers);
+        self::assertTrue($options->reconnectEnabled);
+        self::assertSame(20, $options->maxReconnectAttempts);
+        self::assertTrue($options->tlsRequired);
+        self::assertSame('/etc/nats/ca.pem', $options->tlsCaFile);
+    }
+
     public function testBuildAcceptsAndNormalizesNewStreamAndConsumerOptions(): void
     {
         $config = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, [
@@ -1205,6 +1503,9 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         self::assertNull($config->inactiveThresholdMs());
         self::assertNull($config->replayPolicy());
         self::assertFalse($config->isAutoSetupEnabled());
+        self::assertNull($config->streamPlacement());
+        self::assertFalse($config->isReconnectEnabled());
+        self::assertNull($config->maxReconnectAttempts());
     }
 
     public function testBuildWithInvalidRetentionThrowsException(): void
@@ -1273,12 +1574,45 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         self::assertSame(120, $config->streamDuplicateWindowSeconds());
     }
 
+    /**
+     * A null stream_max_age, like one left out, means no age limit, so any duplicate window is accepted.
+     */
+    public function testBuildTreatsANullMaxAgeAsUnlimitedForTheDuplicateWindow(): void
+    {
+        $config = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, [
+            'stream_max_age' => null,
+            'stream_duplicate_window' => 120,
+        ]);
+
+        self::assertSame(120, $config->streamDuplicateWindowSeconds());
+        self::assertSame(0, $config->streamMaxAgeSeconds());
+    }
+
     public function testBuildWithInvalidMaxAckPendingThrowsException(): void
     {
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('The max_ack_pending option must be a positive integer value.');
 
         (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['max_ack_pending' => 0]);
+    }
+
+    #[DataProvider('invalidInactiveThresholdValues')]
+    public function testBuildWithInvalidInactiveThresholdThrowsException(mixed $value, string $message): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage($message);
+
+        (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['inactive_threshold' => $value]);
+    }
+
+    /**
+     * @return iterable<string, array{mixed, string}>
+     */
+    public static function invalidInactiveThresholdValues(): iterable
+    {
+        yield 'zero' => [0, 'The inactive_threshold option must be a positive value.'];
+        yield 'negative' => [-5, 'The inactive_threshold option must be a positive value.'];
+        yield 'non-numeric' => ['soon', 'The inactive_threshold option must be numeric.'];
     }
 
     public function testBuildWithInvalidStreamMaxConsumersThrowsException(): void
@@ -1351,6 +1685,28 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['stream_deny_delete' => 'maybe']);
     }
 
+    /**
+     * Every flag is checked, including those after one that holds a boolean.
+     */
+    #[DataProvider('laterTriStateFlags')]
+    public function testBuildRejectsAnUnrecognizedValueInAnyTriStateFlag(string $flag): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage("Invalid {$flag} option 'maybe'.");
+
+        (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['stream_deny_delete' => true, $flag => 'maybe']);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function laterTriStateFlags(): iterable
+    {
+        yield 'stream_deny_purge' => ['stream_deny_purge'];
+        yield 'stream_allow_direct' => ['stream_allow_direct'];
+        yield 'stream_allow_rollup_headers' => ['stream_allow_rollup_headers'];
+    }
+
     public function testBuildAcceptsEveryRecognizedBooleanTokenForTriStateFlags(): void
     {
         $config = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, [
@@ -1376,5 +1732,169 @@ final class NatsTransportConfigurationBuilderTest extends TestCase
         self::assertSame(RetentionPolicy::Interest, $config->streamRetention());
         self::assertSame(ReplayPolicy::Original, $config->replayPolicy());
         self::assertTrue($config->isAutoSetupEnabled());
+    }
+
+    public function testBuildAcceptsStreamPlacementOptions(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, [
+            'stream_placement_cluster' => ' eu-west ',
+            'stream_placement_tags' => ['ssd', ' rack-1 ', 'ssd', ''],
+        ]);
+
+        self::assertSame('eu-west', $configuration->streamPlacementCluster());
+        self::assertSame(['ssd', 'rack-1'], $configuration->streamPlacementTags());
+        self::assertSame(['cluster' => 'eu-west', 'tags' => ['ssd', 'rack-1']], $configuration->streamPlacement());
+    }
+
+    public function testBuildSplitsCommaSeparatedStreamPlacementTags(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, [
+            'stream_placement_tags' => 'ssd, eu-west,,',
+        ]);
+
+        self::assertNull($configuration->streamPlacementCluster());
+        self::assertSame(['ssd', 'eu-west'], $configuration->streamPlacementTags());
+        self::assertSame(['tags' => ['ssd', 'eu-west']], $configuration->streamPlacement());
+    }
+
+    public function testBuildParsesStreamPlacementFromDsnQueryString(): void
+    {
+        $listForm = (new NatsTransportConfigurationBuilder())->build(
+            'nats://localhost:4222/test-stream/test-topic?stream_placement_cluster=east&stream_placement_tags[]=ssd&stream_placement_tags[]=fast',
+            []
+        );
+        $commaForm = (new NatsTransportConfigurationBuilder())->build(
+            'nats://localhost:4222/test-stream/test-topic?stream_placement_tags=ssd,fast',
+            []
+        );
+
+        self::assertSame(['cluster' => 'east', 'tags' => ['ssd', 'fast']], $listForm->streamPlacement());
+        self::assertSame(['tags' => ['ssd', 'fast']], $commaForm->streamPlacement());
+    }
+
+    public function testBuildLeavesStreamPlacementUnsetByDefault(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, []);
+
+        self::assertNull($configuration->streamPlacementCluster());
+        self::assertNull($configuration->streamPlacementTags());
+        self::assertNull($configuration->streamPlacement());
+    }
+
+    #[DataProvider('invalidStreamPlacementClusterProvider')]
+    public function testBuildWithInvalidStreamPlacementClusterThrowsException(mixed $value): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('The stream_placement_cluster option must be a non-empty string.');
+
+        (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['stream_placement_cluster' => $value]);
+    }
+
+    /**
+     * @return iterable<string, array{mixed}>
+     */
+    public static function invalidStreamPlacementClusterProvider(): iterable
+    {
+        yield 'empty string' => [''];
+        yield 'whitespace only' => ['   '];
+        yield 'boolean' => [true];
+        yield 'array' => [['east']];
+    }
+
+    #[DataProvider('invalidStreamPlacementTagsProvider')]
+    public function testBuildWithInvalidStreamPlacementTagsThrowsException(mixed $value): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('The stream_placement_tags option must be a non-empty list of non-empty strings, or a comma-separated string of them.');
+
+        (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['stream_placement_tags' => $value]);
+    }
+
+    /**
+     * @return iterable<string, array{mixed}>
+     */
+    public static function invalidStreamPlacementTagsProvider(): iterable
+    {
+        yield 'empty string' => [''];
+        yield 'only separators and whitespace' => [' , ,'];
+        yield 'empty list' => [[]];
+        yield 'list with only blank tags' => [['', '  ']];
+        yield 'list with a nested array' => [['ssd', ['nested']]];
+        yield 'list with a boolean' => [['ssd', true]];
+        yield 'boolean' => [false];
+    }
+
+    public function testBuildWithReconnectOptionsPropagatesToNatsOptions(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, [
+            'reconnect' => 'true',
+            'max_reconnect_attempts' => '25',
+        ]);
+        $options = $this->extractNatsOptions($configuration->client);
+
+        self::assertTrue($configuration->isReconnectEnabled());
+        self::assertSame(25, $configuration->maxReconnectAttempts());
+        self::assertTrue($options->reconnectEnabled);
+        self::assertSame(25, $options->maxReconnectAttempts);
+    }
+
+    public function testBuildWithReconnectFromDsnQueryString(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(
+            'nats://localhost:4222/test-stream/test-topic?reconnect=1&max_reconnect_attempts=3',
+            []
+        );
+        $options = $this->extractNatsOptions($configuration->client);
+
+        self::assertTrue($options->reconnectEnabled);
+        self::assertSame(3, $options->maxReconnectAttempts);
+    }
+
+    /**
+     * The attempt count is forwarded only when configured, so the client's own default must survive
+     * a bare `reconnect: true` - otherwise a client-side change of that default would be masked here.
+     */
+    public function testBuildKeepsTheClientReconnectAttemptDefaultWhenOnlyReconnectIsEnabled(): void
+    {
+        $configuration = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['reconnect' => true]);
+        $options = $this->extractNatsOptions($configuration->client);
+
+        self::assertTrue($options->reconnectEnabled);
+        self::assertSame((new NatsOptions())->maxReconnectAttempts, $options->maxReconnectAttempts);
+    }
+
+    #[DataProvider('invalidMaxReconnectAttemptsProvider')]
+    public function testBuildWithInvalidMaxReconnectAttemptsThrowsException(mixed $value): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('max_reconnect_attempts');
+
+        (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, ['max_reconnect_attempts' => $value]);
+    }
+
+    /**
+     * @return iterable<string, array{mixed}>
+     */
+    public static function invalidMaxReconnectAttemptsProvider(): iterable
+    {
+        yield 'zero' => [0];
+        yield 'negative' => [-1];
+        yield 'fractional' => [1.5];
+        yield 'non-numeric' => ['many'];
+    }
+
+    /**
+     * The logger given to build() is the client's, and the client gets none by default: the transport constructed on
+     * its own, outside the bundle, logs nothing, as before the logger existed.
+     */
+    public function testBuildPassesTheLoggerToTheClientAndNoneByDefault(): void
+    {
+        $logger = new RecordingLogger();
+
+        $withLogger = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, [], $logger);
+        $withoutLogger = (new NatsTransportConfigurationBuilder())->build(self::VALID_DSN, []);
+
+        self::assertSame($logger, $this->extractNatsOptions($withLogger->client)->logger);
+        self::assertNull($this->extractNatsOptions($withoutLogger->client)->logger);
     }
 }

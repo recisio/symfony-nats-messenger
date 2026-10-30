@@ -29,6 +29,8 @@ final class NatsTransportConfigurationTest extends TestCase
                 'stream_max_messages_per_subject' => '25',
                 'stream_storage' => 'memory',
                 'stream_replicas' => '-1',
+                'nak_delay' => '-2',
+                'backoff' => ['-1', 0, '1.5'],
             ],
             natsRetryHandlerEnabled: true,
         );
@@ -43,6 +45,9 @@ final class NatsTransportConfigurationTest extends TestCase
         self::assertSame(StorageBackend::Memory, $configuration->streamStorage());
         self::assertSame(1, $configuration->streamReplicas());
         self::assertTrue($configuration->isNatsRetryHandlerEnabled());
+        // Delays never read below 0 ms, and a backoff entry of 0 stays 0.
+        self::assertSame(0, $configuration->nakDelayMs());
+        self::assertSame([0, 0, 1500], $configuration->backoffMs());
     }
 
     public function testTypedAccessorsProvideDefaults(): void
@@ -65,6 +70,8 @@ final class NatsTransportConfigurationTest extends TestCase
         self::assertSame(StorageBackend::File, $configuration->streamStorage());
         self::assertSame(1, $configuration->streamReplicas());
         self::assertFalse($configuration->isNatsRetryHandlerEnabled());
+        self::assertSame(1.0, $configuration->connectionTimeoutSeconds());
+        self::assertSame(0, $configuration->nakDelayMs());
     }
 
     public function testTypedAccessorsTruncateFloatValues(): void
@@ -112,6 +119,52 @@ final class NatsTransportConfigurationTest extends TestCase
 
         self::assertTrue($enabled->isScheduledMessagesEnabled());
         self::assertFalse($disabled->isScheduledMessagesEnabled());
+    }
+
+    public function testDeduplicationAccessorReturnsConstructorValueAndDefaultsToFalse(): void
+    {
+        $enabled = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: [],
+            natsRetryHandlerEnabled: false,
+            deduplicationEnabled: true,
+        );
+
+        $default = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: [],
+            natsRetryHandlerEnabled: false,
+        );
+
+        self::assertTrue($enabled->isDeduplicationEnabled());
+        self::assertFalse($default->isDeduplicationEnabled());
+    }
+
+    public function testAckSyncAccessorReturnsConstructorValueAndDefaultsToFalse(): void
+    {
+        $enabled = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: [],
+            natsRetryHandlerEnabled: false,
+            ackSyncEnabled: true,
+        );
+
+        $default = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: [],
+            natsRetryHandlerEnabled: false,
+        );
+
+        self::assertTrue($enabled->isAckSyncEnabled());
+        self::assertFalse($default->isAckSyncEnabled());
     }
 
     public function testScheduledMessagesDefaultsToFalse(): void
@@ -255,5 +308,94 @@ final class NatsTransportConfigurationTest extends TestCase
 
         self::assertTrue($enabled->isAutoSetupEnabled());
         self::assertFalse($disabled->isAutoSetupEnabled());
+    }
+
+    public function testStreamPlacementAccessorsBuildThePlacementBlock(): void
+    {
+        $both = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: ['stream_placement_cluster' => 'east', 'stream_placement_tags' => ['ssd', 'fast']],
+            natsRetryHandlerEnabled: false,
+        );
+        $tagsOnly = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: ['stream_placement_tags' => 'ssd, fast'],
+            natsRetryHandlerEnabled: false,
+        );
+        $clusterOnly = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: ['stream_placement_cluster' => ' east '],
+            natsRetryHandlerEnabled: false,
+        );
+
+        self::assertSame('east', $both->streamPlacementCluster());
+        self::assertSame(['ssd', 'fast'], $both->streamPlacementTags());
+        self::assertSame(['cluster' => 'east', 'tags' => ['ssd', 'fast']], $both->streamPlacement());
+        self::assertSame(['tags' => ['ssd', 'fast']], $tagsOnly->streamPlacement());
+        self::assertSame(['cluster' => 'east'], $clusterOnly->streamPlacement());
+    }
+
+    public function testStreamPlacementAccessorsTreatBlankAndMissingValuesAsUnset(): void
+    {
+        $blank = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: ['stream_placement_cluster' => '   ', 'stream_placement_tags' => ['', '  ']],
+            natsRetryHandlerEnabled: false,
+        );
+        $missing = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: [],
+            natsRetryHandlerEnabled: false,
+        );
+        // Types the builder rejects read as unset here too, instead of becoming the cluster "1".
+        $wrongType = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: ['stream_placement_cluster' => true],
+            natsRetryHandlerEnabled: false,
+        );
+
+        self::assertNull($blank->streamPlacementCluster());
+        self::assertNull($blank->streamPlacementTags());
+        self::assertNull($blank->streamPlacement());
+        self::assertNull($missing->streamPlacementCluster());
+        self::assertNull($missing->streamPlacementTags());
+        self::assertNull($missing->streamPlacement());
+        self::assertNull($wrongType->streamPlacementCluster());
+        self::assertNull($wrongType->streamPlacement());
+    }
+
+    public function testReconnectAccessorsReadTheOptions(): void
+    {
+        $configured = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: ['reconnect' => 'yes', 'max_reconnect_attempts' => '7'],
+            natsRetryHandlerEnabled: false,
+        );
+        $defaults = new NatsTransportConfiguration(
+            topic: 'topic',
+            streamName: 'stream',
+            client: new NatsClient(),
+            options: [],
+            natsRetryHandlerEnabled: false,
+        );
+
+        self::assertTrue($configured->isReconnectEnabled());
+        self::assertSame(7, $configured->maxReconnectAttempts());
+        self::assertFalse($defaults->isReconnectEnabled());
+        self::assertNull($defaults->maxReconnectAttempts());
     }
 }

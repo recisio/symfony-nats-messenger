@@ -8,10 +8,19 @@ for Claude Code. For architecture see [STRUCTURE.md](STRUCTURE.md); for human on
 
 A Symfony Messenger **transport** for NATS JetStream. It implements `TransportInterface`,
 `MessageCountAwareInterface`, and `SetupableTransportInterface`, bridging Symfony's message bus to
-NATS via the async `recisio/php-nats-jetstream-client` (`dev-main`, amphp-based).
+NATS via the async `idct/php-nats-jetstream-client` (`^2.27.1`, amphp-based). It ships
+`IDCTNatsMessengerBundle` (auto-enabled by Flex), which registers the transport factory
+and the igbinary serializer so projects need no manual wiring.
 
-- **PHP:** `^8.1` · **Symfony:** `^6.4 || ^7 || ^8` · **NATS:** `^2.9` (`^2.12` for scheduled messages)
+- **PHP:** `^8.2` · **Symfony:** `^7.2 || ^8` · **NATS:** `^2.9` (`^2.12` for scheduled messages)
 - Everything NATS-specific lives behind the `IDCT\NATS\…` client; this library is the synchronous adapter.
+
+## Project memory
+
+Read [docs/PROJECT_MEMORY.md](docs/PROJECT_MEMORY.md) when starting work for maintainer preferences,
+the local client-library relationship, behavioral pitfalls, and a dated issue/environment snapshot.
+Refresh changeable facts from source and GitHub before relying on them; update the memory when new
+findings affect future work. This file remains the project instruction source, with AGENTS.md.
 
 ## Commands (prefer composer scripts over ad-hoc invocations)
 
@@ -24,9 +33,10 @@ composer test:unit:fast          # PHPUnit only, no coverage
 composer test:unit               # PHPUnit with coverage → clover.xml + coverage/ (HTML)
 composer coverage:check          # enforce ≥ 90% statement coverage from clover.xml
 
-composer nats:start              # start NATS in Docker (tests/nats/docker-compose.yaml)
+composer nats:start              # generate the test TLS certs, then start NATS in Docker (tests/nats/docker-compose.yaml)
 composer test:functional:setup   # install Behat deps (first time only)
 composer test:functional         # run Behat scenarios (needs nats:start)
+composer examples                # run examples/*.php against the test NATS (needs nats:start)
 composer nats:stop               # stop NATS
 ```
 
@@ -43,6 +53,13 @@ composer nats:stop               # stop NATS
 - PHPStan **level max** must stay clean - no new baseline entries; fix the types instead.
 - Keep PHPUnit metadata as **attributes** (`#[DataProvider]`, `#[Test]`), not doc-comment annotations
   (doc-comment metadata is deprecated in PHPUnit 11, removed in 12).
+- The unit suite runs on PHPUnit 11 to 13: PHP 8.2 installs 11, PHP 8.3 installs 12 and PHP 8.4 or later
+  installs 13 (CI runs 11 and 13). Make a test double that sets no expectations with `createStub()`, not
+  `createMock()`: PHPUnit 12 and later report a notice for a mock without expectations, and CI's PHP 8.5 job
+  fails on it.
+- Behat step definitions and hooks are **attributes** (`#[Given]`, `#[When]`, `#[Then]`, `#[AfterScenario]`), and the
+  Behat configuration is `tests/functional/behat.php`: Behat 4 reads neither doc-comment annotations nor YAML. The
+  configuration is strict, so a scenario with an undefined step fails the run instead of being skipped.
 - `TransportOption` is the single source of truth for option keys; every case needs a `DEFAULT_OPTIONS`
   entry in `NatsTransportConfigurationBuilder` (guarded by `testDefaultOptionsCoversAllTransportOptionCases`).
 - Mark DSN/credential parameters with `#[\SensitiveParameter]`.
@@ -54,22 +71,54 @@ composer nats:stop               # stop NATS
 - **Async client, sync contract.** Client calls return `Amp\Future`; resolve them with `->await()`.
   Symfony Messenger's transport API is blocking.
 - **Lazy connection.** No socket opens in the constructor - `jetStream()` connects on first use, and dials
-  again once the client has closed (it runs with reconnect off, so a lost connection leaves it Closed). A
+  again once the client has closed (unless `reconnect: true`, it runs with reconnect off, so a lost connection
+  leaves it Closed). A
   connection unused for longer than `ping_after_idle`, or one an operation just failed on (not counting
-  JetStream replies), gets a PING first and is replaced if it goes unanswered; `keepalive()` never pings
-  or dials (it runs in a signal handler).
+  JetStream replies, but counting a pull the server did not answer), gets a PING first and is replaced if
+  it goes unanswered; `ping_after_idle: 0` turns both checks off, and `keepalive()` never pings or dials (it
+  runs in a signal handler).
+- **Reconnect mode (`reconnect: true`): the client owns recovery.** The transport leaves a Connecting client
+  alone (no PING, no dial; the operation waits within its own budget), reads a failed PING by the client's state
+  and reconnect count (recovering or already recovered: kept; the same connection silent: replaced; Closed:
+  dialled again, which runs the client's attempt loop inline), verifies `auto_setup` provisioning again once the
+  count moved and re-provisions once when the first publish after a reconnect gets 503 "No JetStream responder".
+  The count is read only with the option on; mocked clients in the default-mode tests have no stats stub. The
+  factory's optional logger reaches the client (the bundle passes `logger`); a reconnect that gives up logs the
+  discarded buffer at error level. `409 Server Shutdown` and `409 Leadership Change` end a pull as an empty batch
+  in both modes.
 - **Pull consumers + explicit ACK.** A message is only "processed" once ACK'd. This underpins
   `retry_handler` and shared-consumer load balancing.
-- **`get()` swallows JetStream 404 and 408** (consumer-missing / timeout-empty) as empty results;
-  other codes propagate.
+- **`get()` reads JetStream 408 and 404 as an empty pull** (no messages); other codes propagate. A
+  missing consumer reports 503, not 404: with `auto_setup` it is re-provisioned once, otherwise `get()` throws.
+  The client also reports a pull that got no answer before its own deadline as 408 ("No messages received
+  within timeout"); that one makes the next operation PING first, since the server did not answer.
+- **A pull refused at the subscription limit throws `TransportException`.** The transport holds two subscriptions
+  per connection (the request reply inbox and the pull's inbox). At a limit of one, the client's
+  `SubscriptionLimitException` (client `^2.27`) becomes Symfony's `TransportException` naming the stream, consumer
+  and limit, in `fetchBatchMessages()`. The next operation still PINGs first: the server sends the same error when
+  an account's limit is lowered and then closes the connection, so the error does not prove the connection is alive.
 - **`setup()` create-then-update.** On a stream conflict it reads the live config, **merges** subjects,
   preserves server fields, and updates - it never blindly overwrites an existing stream.
 - **Retry strategy:** `retry_handler=symfony` (default) → TERM (Symfony's failure transport retries);
-  `retry_handler=nats` → NAK (NATS redelivers).
+  `retry_handler=nats` → NAK (NATS redelivers), and `send()` skips the copy Symfony's retry sends (a received
+  envelope with a retry count), so Symfony's `max_retries` has no effect in nats mode.
+- **`keepalive()` queues, never waits.** Symfony calls it from a SIGALRM handler, where fibers cannot switch,
+  so it queues `inProgress()->ignore()`, which goes out the next time the event loop runs.
+- **Duplicate protection:** a `DeduplicationIdStamp`, added on the first send with `deduplicate` or by the
+  application, becomes `Nats-Msg-Id` = `<id>:<topic>:<retry count>`, plus `:failed:<receiver>` on a
+  failure-transport copy. JetStream deduplicates per stream, whatever the subject.
+- **Serializers strip non-sendable stamps** (`NonSendableStampInterface`, such as the worker's `AckStamp`,
+  which holds a closure) before encoding, as Symfony's own serializers do.
 - **Scheduled messages:** only when `scheduled_messages=true` does a `DelayStamp` route to
   `{topic}.delayed.{uuid}` with `Nats-Schedule` headers; otherwise the delay is ignored.
 - **Serializer security:** the default `IgbinarySerializer` `unserialize()`s payloads - unsafe on
   untrusted subjects. Don't weaken the README security warnings.
+- **The bundle registers each service under one id, its class name.** An application's own entry under that id
+  (the setup before the bundle) replaces the bundle's. Symfony 7.4+ wraps the serializer each transport names in
+  a `SigningSerializer`, one for each service id in the transports' configuration, compared as strings. An alias
+  next to the id it points to would wrap it twice for the transport that names the alias, and that transport
+  could then never decode a message that must be signed (`RunCommandMessage`, any `sign: true` handler). Don't
+  give the bundle's services a second id.
 
 ## Documentation maintenance (required, per AGENTS.md)
 

@@ -12,15 +12,17 @@ namespace IDCT\NatsMessenger\Options;
  *
  * **Consumer & Batching:** CONSUMER, BATCHING, MAX_BATCH_TIMEOUT, CONNECTION_TIMEOUT,
  *                          MAX_ACK_PENDING, INACTIVE_THRESHOLD, REPLAY_POLICY
- * **Connection:** PING_AFTER_IDLE
+ * **Connection:** PING_AFTER_IDLE, REQUEST_TIMEOUT, RECONNECT, MAX_RECONNECT_ATTEMPTS
  * **Stream Limits:** STREAM_MAX_AGE, STREAM_MAX_BYTES, STREAM_MAX_MESSAGES,
  *                    STREAM_MAX_MESSAGES_PER_SUBJECT, STREAM_MAX_MESSAGE_SIZE, STREAM_MAX_CONSUMERS,
  *                    STREAM_STORAGE, STREAM_REPLICAS
  * **Stream Policy:** STREAM_RETENTION, STREAM_DISCARD, STREAM_DUPLICATE_WINDOW, STREAM_COMPRESSION,
  *                    STREAM_DESCRIPTION, STREAM_DENY_DELETE, STREAM_DENY_PURGE, STREAM_ALLOW_DIRECT,
  *                    STREAM_ALLOW_ROLLUP_HEADERS
+ * **Stream Placement:** STREAM_PLACEMENT_CLUSTER, STREAM_PLACEMENT_TAGS
  * **Retry Strategy:** RETRY_HANDLER, NAK_DELAY, ACK_WAIT, MAX_DELIVER, BACKOFF
  * **Acknowledgement:** ACK_SYNC
+ * **Deduplication:** DEDUPLICATE
  * **Scheduling:** SCHEDULED_MESSAGES
  * **Provisioning:** AUTO_SETUP
  * **TLS:** TLS_REQUIRED, TLS_HANDSHAKE_FIRST, TLS_CA_FILE, TLS_CERT_FILE, TLS_KEY_FILE,
@@ -34,6 +36,9 @@ enum TransportOption: string
     case MAX_BATCH_TIMEOUT = 'max_batch_timeout';
     case CONNECTION_TIMEOUT = 'connection_timeout';
     case PING_AFTER_IDLE = 'ping_after_idle';
+    case REQUEST_TIMEOUT = 'request_timeout';
+    case RECONNECT = 'reconnect';
+    case MAX_RECONNECT_ATTEMPTS = 'max_reconnect_attempts';
     case MAX_ACK_PENDING = 'max_ack_pending';
     case INACTIVE_THRESHOLD = 'inactive_threshold';
     case REPLAY_POLICY = 'replay_policy';
@@ -54,6 +59,8 @@ enum TransportOption: string
     case STREAM_DENY_PURGE = 'stream_deny_purge';
     case STREAM_ALLOW_DIRECT = 'stream_allow_direct';
     case STREAM_ALLOW_ROLLUP_HEADERS = 'stream_allow_rollup_headers';
+    case STREAM_PLACEMENT_CLUSTER = 'stream_placement_cluster';
+    case STREAM_PLACEMENT_TAGS = 'stream_placement_tags';
     case RETRY_HANDLER = 'retry_handler';
     case NAK_DELAY = 'nak_delay';
     case ACK_WAIT = 'ack_wait';
@@ -61,6 +68,7 @@ enum TransportOption: string
     case BACKOFF = 'backoff';
     case SCHEDULED_MESSAGES = 'scheduled_messages';
     case ACK_SYNC = 'ack_sync';
+    case DEDUPLICATE = 'deduplicate';
     case AUTO_SETUP = 'auto_setup';
 
     case TLS_REQUIRED = 'tls_required';

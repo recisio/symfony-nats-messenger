@@ -2,13 +2,23 @@
 
 ## Overview
 
-Symfony Messenger transport for NATS JetStream. PHP 8.1+, Symfony ^6.4 / ^7 / ^8.
-Uses `recisio/php-nats-jetstream-client` (amphp-based coroutines).
+Symfony Messenger transport for NATS JetStream. PHP 8.2+, Symfony ^7.2 / ^8.0.
+Uses `idct/php-nats-jetstream-client` (amphp-based coroutines).
+Ships `IDCTNatsMessengerBundle` (Flex auto-enables it), which registers the transport factory
+and the igbinary serializer - no manual wiring needed. Each service has one id, its class name:
+Symfony wraps a transport's serializer for signing once per id, so a second id would wrap it twice.
+
+## Project Memory
+
+Read [docs/PROJECT_MEMORY.md](docs/PROJECT_MEMORY.md) when starting work for maintainer preferences,
+the local client-library relationship, behavioral pitfalls, and a dated issue/environment snapshot.
+Refresh changeable facts from source and GitHub before relying on them; update the memory when new
+findings affect future work. This guide remains the project instruction source.
 
 ## Installation
 
 ```bash
-composer require recisio/symfony-nats-messenger
+composer require idct/symfony-nats-messenger
 ```
 
 Development setup:
@@ -21,6 +31,7 @@ composer test              # PHPStan + fast unit tests (run after every change)
 
 ```
 src/
+├── IDCTNatsMessengerBundle.php                # Symfony bundle - auto-registers factory + serializer services
 ├── NatsTransport.php                          # TransportInterface, MessageCountAwareInterface, SetupableTransportInterface
 ├── NatsTransportFactory.php                   # TransportFactoryInterface - DSN parsing, transport creation
 ├── TypeCoercion.php                           # Safe scalar type coercion helpers (final, static)
@@ -37,7 +48,7 @@ src/
 ```
 tests/
 ├── bootstrap.php
-├── unit/                                       # PHPUnit 11 - fast, no NATS required
+├── unit/                                       # PHPUnit 11 to 13 - fast, no NATS required
 │   ├── NatsTransportTest.php                   # Transport core: setup, send, get, ack, reject, retry
 │   ├── NatsTransportFactoryTest.php            # Factory: DSN scheme detection, transport creation
 │   ├── Options/
@@ -61,7 +72,7 @@ tests/
 └── nats/                                       # Docker Compose + NATS configs for testing
     ├── docker-compose.yaml
     ├── nats.conf / nats-tls.conf / nats-mtls.conf
-    └── certs/                                  # Test TLS certificates
+    └── certs/                                  # generate.sh for the test TLS certificates (generated, not committed)
 ```
 
 ## Features
@@ -79,6 +90,10 @@ tests/
 - **Authentication**: username/password, token, JWT, NKey
 - **Serialization**: igbinary (default with fallback) or custom via `AbstractEnveloperSerializer`
 - **Publish validation**: JetStream publish responses are parsed and validated
+- **Connection checks**: a lost connection is dialled again; `ping_after_idle` PINGs a connection that sat idle, or that an operation failed on, before reuse
+- **Timeouts**: `connection_timeout` (the dial), `request_timeout` (replies from the server), `max_batch_timeout` (pulls)
+- **Duplicate protection**: the `deduplicate` option and `DeduplicationIdStamp`, sent as `Nats-Msg-Id`
+- **Keepalive**: `messenger:consume --keepalive`, an in-progress acknowledgement queued from the signal handler
 
 ## Testing
 
@@ -96,14 +111,22 @@ composer coverage:check          # Verify ≥ 90% statement coverage
 ### Functional tests (require Docker)
 ```bash
 composer test:functional:setup   # Install Behat dependencies (first time)
-composer nats:start              # Start NATS in Docker
+composer nats:start              # Generate the test TLS certs, then start NATS in Docker
 composer test:functional         # Run Behat scenarios
+composer examples                # Run examples/*.php against the test NATS (needs nats:start)
 composer nats:stop               # Stop NATS
 ```
 
 ### Key testing patterns
 - Unit tests use `TestableNatsTransport` (overrides `connect()` to skip live NATS)
-- `RuntimeTestableNatsTransport` allows injecting mock `JetStreamContext` and `NatsClient` via setters
+- `RuntimeTestableNatsTransport` allows injecting `JetStreamContext` and `NatsClient` test doubles via setters
+- The unit suite runs on PHPUnit 11 to 13: PHP 8.2 installs 11, PHP 8.3 installs 12 and PHP 8.4 or later
+  installs 13 (CI runs 11 and 13). Make a test double that sets no expectations with `createStub()`, not
+  `createMock()`: PHPUnit 12 and later report a notice for a mock without expectations, and CI's PHP 8.5 job
+  fails on it. Keep `createMock()` where the test checks calls, for example `expects(self::never())`.
+- Behat step definitions and hooks are **attributes** (`#[Given]`, `#[When]`, `#[Then]`, `#[AfterScenario]`), and the
+  Behat configuration is `tests/functional/behat.php`: Behat 4 reads neither doc-comment annotations nor YAML. The
+  configuration is strict, so a scenario with an undefined step fails the run instead of being skipped.
 - Mock `Future::complete()` / `Future::error()` for async return values
 - `self::callback()` for complex assertion on method arguments (e.g., stream options arrays)
 

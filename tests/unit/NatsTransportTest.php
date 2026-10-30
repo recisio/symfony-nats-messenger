@@ -4,12 +4,14 @@ namespace IDCT\NatsMessenger\Tests\Unit;
 
 use Amp\DeferredFuture;
 use Amp\Future;
+use IDCT\NATS\Connection\ConnectionStats;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
 use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
@@ -17,15 +19,32 @@ use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\Models\ConsumerInfo;
 use IDCT\NATS\JetStream\Models\StreamInfo;
 use IDCT\NatsMessenger\NatsTransport;
+use IDCT\NatsMessenger\Stamp\DeduplicationIdStamp;
+use IDCT\NatsMessenger\Tests\Support\StrictHeaderNameSerializer;
 use InvalidArgumentException;
 use LogicException;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Exception\TransportException;
+use Psr\Container\ContainerInterface;
+use Symfony\Component\EventDispatcher\EventDispatcher;
+use Symfony\Component\Messenger\EventListener\SendFailedMessageForRetryListener;
+use Symfony\Component\Messenger\EventListener\StopWorkerOnMessageLimitListener;
+use Symfony\Component\Messenger\Handler\HandlersLocator;
+use Symfony\Component\Messenger\MessageBus;
+use Symfony\Component\Messenger\Middleware\HandleMessageMiddleware;
+use Symfony\Component\Messenger\Retry\MultiplierRetryStrategy;
 use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Stamp\ErrorDetailsStamp;
+use Symfony\Component\Messenger\Stamp\ReceivedStamp;
+use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
+use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
+use Symfony\Component\Messenger\Stamp\StampInterface;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
+use Symfony\Component\Messenger\Worker;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\SetupableTransportInterface;
@@ -306,6 +325,32 @@ final class NatsTransportTest extends TestCase
         $transport->send($envelope);
     }
 
+    /**
+     * The exception that carries the ErrorDetailsStamp's message keeps the serializer's error as its previous
+     * exception, and has no code of its own.
+     */
+    public function testSendSerializationFailureKeepsTheSerializerErrorAsThePreviousException(): void
+    {
+        $serializerError = new \RuntimeException('cannot serialize', 42);
+        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer->expects(self::once())->method('encode')->willThrowException($serializerError);
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::never())->method('publish');
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $serializer);
+        $transport->setJetStreamContext($jetStream);
+        $envelope = new Envelope(new \stdClass(), [new ErrorDetailsStamp(\RuntimeException::class, 500, 'Custom serialization message')]);
+
+        try {
+            $transport->send($envelope);
+            self::fail('send() was expected to fail.');
+        } catch (\RuntimeException $exception) {
+            self::assertSame('Custom serialization message', $exception->getMessage());
+            self::assertSame(0, $exception->getCode());
+            self::assertSame($serializerError, $exception->getPrevious());
+        }
+    }
+
     public function testSendPublishesEncodedBodyWithoutHeaders(): void
     {
         $serializer = $this->createMock(SerializerInterface::class);
@@ -376,6 +421,33 @@ final class NatsTransportTest extends TestCase
         $transport->setJetStreamContext($jetStream);
 
         self::assertCount(1, array_values(iterator_to_array($transport->get())));
+    }
+
+    public function testGetLeavesOutHeadersWhoseNameIsAnInteger(): void
+    {
+        // Any publisher can send a header named "1" or "-5". The client returns such a name as an int key, as PHP
+        // stores such array keys, while decode() takes string names. This serializer reads each name as a string
+        // under strict types, as an application's own may, so an int key makes it throw a TypeError, and get()
+        // would then TERM the message. The transport leaves those headers out and the message decodes with the
+        // rest. "007" is no integer to PHP, so that header stays.
+        $serializer = new StrictHeaderNameSerializer();
+
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('fetchBatch')
+            ->willReturn(Future::complete([
+                new NatsMessage('test-topic', 1, 'reply-id', 'payload', "NATS/1.0\r\n1:x\r\nfoo:bar\r\n-5:y\r\n007:z\r\n\r\n"),
+            ]));
+        $jetStream->expects(self::never())->method('term');
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $serializer);
+        $transport->setJetStreamContext($jetStream);
+
+        $envelopes = array_values(iterator_to_array($transport->get()));
+
+        self::assertSame([['body' => 'payload', 'headers' => ['foo' => 'bar', '007' => 'z']]], $serializer->decoded);
+        self::assertCount(1, $envelopes);
+        self::assertSame('reply-id', $envelopes[0]->last(TransportMessageIdStamp::class)?->getId());
     }
 
     public function testSendUsesPublishWithHeadersWhenHeadersArePresent(): void
@@ -453,7 +525,11 @@ final class NatsTransportTest extends TestCase
         self::assertSame(['term:reply-empty'], $transport->failureActions);
     }
 
-    public function testGetReturnsEmptyArrayWhenConsumerIsMissing(): void
+    /**
+     * A 404 reports a pull that found no messages. A missing consumer does not report 404 but 503, which
+     * propagates without auto_setup ({@see testGetStillPropagates503WhenAutoSetupIsDisabled()}).
+     */
+    public function testGetReturnsEmptyArrayWhenThePullReports404(): void
     {
         $serializer = $this->createMock(SerializerInterface::class);
         $serializer->expects(self::never())->method('decode');
@@ -461,7 +537,7 @@ final class NatsTransportTest extends TestCase
         $jetStream = $this->createMock(JetStreamContext::class);
         $jetStream->expects(self::once())
             ->method('fetchBatch')
-            ->willReturn(Future::error(new JetStreamException('missing consumer', 404)));
+            ->willReturn(Future::error(new JetStreamException('No Messages', 404)));
 
         $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $serializer);
         $transport->setJetStreamContext($jetStream);
@@ -580,6 +656,31 @@ final class NatsTransportTest extends TestCase
         // before decoding and never triggers retry handling.
         self::assertSame([], $envelopes);
         self::assertSame([], $transport->failureActions);
+    }
+
+    /**
+     * Skipping a message without a reply subject does not end the batch: the messages after it are delivered.
+     */
+    public function testGetDeliversTheRestOfTheBatchAfterAMessageWithoutAReplySubject(): void
+    {
+        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer->expects(self::once())->method('decode')->willReturn(new Envelope(new \stdClass()));
+
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('fetchBatch')
+            ->willReturn(Future::complete([
+                new NatsMessage('test-topic', 1, null, 'payload'),
+                new NatsMessage('test-topic', 2, 'reply-valid', 'payload'),
+            ]));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $serializer);
+        $transport->setJetStreamContext($jetStream);
+
+        $envelopes = array_values(iterator_to_array($transport->get()));
+
+        self::assertCount(1, $envelopes);
+        self::assertSame('reply-valid', $envelopes[0]->last(TransportMessageIdStamp::class)?->getId());
     }
 
     public function testGetDecodesLargePayloadWithoutTruncation(): void
@@ -760,6 +861,93 @@ final class NatsTransportTest extends TestCase
         $transport->keepalive((new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('message-id')));
     }
 
+    /**
+     * Symfony's `messenger:consume --keepalive` calls keepalive() from its SIGALRM handler, where PHP does not
+     * allow switching fibers. Waiting for the acknowledgement there failed with "Cannot switch fibers in
+     * current execution context" and stopped the worker at the first alarm (#48); it is queued instead.
+     */
+    #[RequiresPhpExtension('pcntl')]
+    #[RequiresPhpExtension('posix')]
+    public function testKeepaliveFromASignalHandlerQueuesTheAcknowledgementInsteadOfWaiting(): void
+    {
+        $acknowledged = new DeferredFuture();
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('inProgress')->willReturn($acknowledged->getFuture());
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+        $envelope = (new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('reply-token'));
+
+        $failure = null;
+        $asyncSignals = pcntl_async_signals(false);
+        pcntl_signal(SIGALRM, static function () use ($transport, $envelope, &$failure): void {
+            try {
+                $transport->keepalive($envelope);
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+        try {
+            posix_kill(posix_getpid(), SIGALRM);
+            pcntl_signal_dispatch();
+        } finally {
+            pcntl_signal(SIGALRM, SIG_DFL);
+            pcntl_async_signals($asyncSignals);
+        }
+
+        self::assertNull($failure, 'keepalive() failed inside the signal handler: ' . $failure?->getMessage());
+        $acknowledged->complete();
+    }
+
+    /**
+     * Outside a signal handler too, keepalive() returns without waiting for the server.
+     */
+    public function testKeepaliveDoesNotWaitForTheAcknowledgement(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('inProgress')->willReturn((new DeferredFuture())->getFuture());
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->keepalive((new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('reply-token')));
+    }
+
+    /**
+     * A transport without a connection sends nothing rather than dialling, which would mean waiting.
+     */
+    public function testKeepaliveWithoutAConnectionSendsNothingAndDoesNotDial(): void
+    {
+        $client = $this->createMock(NatsClient::class);
+        $client->expects(self::never())->method('connect');
+
+        $transport = new RealConnectNatsTransport(self::VALID_DSN, []);
+        $transport->setClient($client);
+
+        $transport->keepalive((new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('reply-token')));
+    }
+
+    /**
+     * An acknowledgement that fails - the connection is gone - stays on its own fiber: nothing reaches the
+     * event loop as an unhandled error, which would stop the worker.
+     */
+    public function testKeepaliveWhoseAcknowledgementFailsRaisesNoUnhandledError(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        // A new future per call, which only the transport holds: left unhandled, it would be reported as soon
+        // as the transport lets go of it, so within this test.
+        $jetStream->expects(self::once())->method('inProgress')->willReturnCallback(
+            static fn (): Future => Future::error(new ConnectionException('Connection is not open')),
+        );
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->keepalive((new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('reply-token')));
+        // An unhandled failure would surface from the event loop here.
+        \Amp\delay(0);
+    }
+
     public function testKeepaliveWithoutTransportStampThrowsException(): void
     {
         $transport = new TestableNatsTransport(self::VALID_DSN, []);
@@ -902,7 +1090,7 @@ final class NatsTransportTest extends TestCase
         // A Closed client has already released its socket: there is nothing to disconnect.
         $client->expects(self::never())->method('disconnect');
 
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
         $transport = new RealConnectNatsTransport(self::VALID_DSN, [], $serializer);
         $transport->setClient($client);
@@ -937,7 +1125,7 @@ final class NatsTransportTest extends TestCase
     public function testAutoSetupVerifiesTheNewConnectionBeforeTheSameCallPublishes(): void
     {
         $calls = [];
-        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream = $this->createStub(JetStreamContext::class);
         $jetStream->method('addStream')->willReturnCallback(static function () use (&$calls): Future {
             $calls[] = 'addStream';
 
@@ -963,7 +1151,7 @@ final class NatsTransportTest extends TestCase
         $client = $this->clientReportingState($state, [Future::complete(), Future::complete()], $calls);
         $client->method('jetStream')->willReturn($jetStream);
 
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
         $transport = new RealConnectNatsTransport(self::VALID_DSN, ['auto_setup' => true], $serializer);
         $transport->setClient($client);
@@ -998,7 +1186,7 @@ final class NatsTransportTest extends TestCase
         $client = $this->clientReportingState($state, [Future::complete(), Future::error($refused), Future::complete()]);
         $client->method('jetStream')->willReturn($jetStream);
 
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
         $transport = new RealConnectNatsTransport(self::VALID_DSN, ['auto_setup' => true], $serializer);
         $transport->setClient($client);
@@ -1153,6 +1341,29 @@ final class NatsTransportTest extends TestCase
         $transport->ack($envelope);
     }
 
+    /**
+     * Only a connection unused for longer than ping_after_idle is checked; one last used exactly that long ago
+     * is not.
+     */
+    public function testConnectionUnusedForExactlyPingAfterIdleIsNotPinged(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('ack')->willReturn(Future::complete());
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+        $client->expects(self::never())->method('rtt');
+
+        $transport = new ClockedNatsTransport(self::VALID_DSN, ['ping_after_idle' => 30]);
+        $transport->setClient($client);
+        $envelope = (new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('reply-token'));
+        $transport->ack($envelope);
+
+        $transport->now += 30;
+        $transport->ack($envelope);
+    }
+
     public function testPingAfterIdleZeroTurnsTheCheckOff(): void
     {
         $jetStream = $this->createMock(JetStreamContext::class);
@@ -1201,6 +1412,36 @@ final class NatsTransportTest extends TestCase
     }
 
     /**
+     * The same holds for a pull that ends empty, which the client reports as a 408: counted as use only when
+     * messages came, an empty pull longer than ping_after_idle made every next pull PING first, with one
+     * connection_timeout for the server to answer.
+     */
+    public function testIdleTimeCountsFromTheEndOfAnEmptyPull(): void
+    {
+        $transport = null;
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('fetchBatch')->willReturnCallback(
+            static function () use (&$transport): Future {
+                // The pull waits 40 s for messages, and none come.
+                $transport->now += 40;
+
+                return Future::error(new JetStreamException('JetStream pull request ended with status 408: Request Timeout', 408));
+            },
+        );
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+        $client->expects(self::never())->method('rtt');
+
+        $transport = new ClockedNatsTransport(self::VALID_DSN, ['ping_after_idle' => 30, 'max_batch_timeout' => 40]);
+        $transport->setClient($client);
+        self::assertSame([], iterator_to_array($transport->get()));
+        $transport->now += 5;
+        self::assertSame([], iterator_to_array($transport->get()));
+    }
+
+    /**
      * With auto_setup, the connection that replaces one that failed the PING is verified again before it is
      * used, as after close().
      */
@@ -1222,7 +1463,7 @@ final class NatsTransportTest extends TestCase
         $client->expects(self::once())->method('rtt')->willReturn(Future::error(new ConnectionException('Connection lost')));
         $client->method('disconnect')->willReturn(Future::complete());
 
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
         $transport = new ClockedNatsTransport(self::VALID_DSN, ['ping_after_idle' => 30, 'auto_setup' => true], $serializer);
         $transport->setClient($client);
@@ -1253,7 +1494,7 @@ final class NatsTransportTest extends TestCase
         $client->method('jetStream')->willReturn($jetStream);
         $client->expects(self::once())->method('rtt')->willReturn(Future::complete(0.001));
 
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
         $transport = new ClockedNatsTransport(self::VALID_DSN, ['ping_after_idle' => 30, 'auto_setup' => true], $serializer);
         $transport->setClient($client);
@@ -1265,9 +1506,10 @@ final class NatsTransportTest extends TestCase
 
     /**
      * The client can keep reporting a connection Open after its socket died - older clients after a failed
-     * write ("The stream is not writable"), 2.10 after the server's fatal -ERR - so an operation that failed
-     * on the connection makes the next one check it with a PING first, and move to a new connection when it
-     * goes unanswered, instead of failing the same way until the process restarts (#49).
+     * write ("The stream is not writable"), 2.10.0 after the server's fatal -ERR, 2.10.3 after 'maximum
+     * subscriptions exceeded' when the server closes the connection right behind it - so an operation that
+     * failed on the connection makes the next one check it with a PING first, and move to a new connection
+     * when it goes unanswered, instead of failing the same way until the process restarts (#49).
      */
     public function testOperationThatFailedOnTheConnectionMakesTheNextOneCheckItFirst(): void
     {
@@ -1381,7 +1623,9 @@ final class NatsTransportTest extends TestCase
     public function testJetStreamReplyDoesNotMakeTheNextOperationCheckTheConnection(): void
     {
         $jetStream = $this->createMock(JetStreamContext::class);
-        $jetStream->expects(self::exactly(2))->method('fetchBatch')->willReturn(Future::error(new JetStreamException('Request Timeout', 408)));
+        $jetStream->expects(self::exactly(2))->method('fetchBatch')->willReturn(
+            Future::error(new JetStreamException('JetStream pull request ended with status 408: Request Timeout', 408)),
+        );
         $jetStream->expects(self::exactly(2))->method('publish')->willReturnOnConsecutiveCalls(
             Future::error(new JetStreamException('maximum messages exceeded', 400)),
             Future::complete(),
@@ -1392,7 +1636,7 @@ final class NatsTransportTest extends TestCase
         $client->method('jetStream')->willReturn($jetStream);
         $client->expects(self::never())->method('rtt');
 
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
         $transport = new ClockedNatsTransport(self::VALID_DSN, ['ping_after_idle' => 30], $serializer);
         $transport->setClient($client);
@@ -1404,6 +1648,112 @@ final class NatsTransportTest extends TestCase
             // Rejected by the server, which therefore answered.
         }
         $transport->send(new Envelope(new \stdClass()));
+    }
+
+    /**
+     * A pull that got no answer before the client's own deadline is no reply, though the client reports it as
+     * a JetStream error: a server that is there ends every pull before then, with status 408 when it found no
+     * messages. A half-open connection takes the pull request and delivers nothing. The pull reads as an empty
+     * batch, and the next operation checks the connection first, so the pull after it runs on a new one.
+     */
+    public function testPullTheServerDidNotAnswerMakesTheNextOperationCheckTheConnection(): void
+    {
+        $oldConnection = $this->createMock(JetStreamContext::class);
+        $oldConnection->expects(self::once())->method('fetchBatch')->willReturn(
+            Future::error(new JetStreamException('No messages received within timeout', 408)),
+        );
+        $newConnection = $this->createMock(JetStreamContext::class);
+        $newConnection->expects(self::exactly(2))->method('fetchBatch')->willReturn(
+            Future::error(new JetStreamException('JetStream pull request ended with status 408: Request Timeout', 408)),
+        );
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete(), Future::complete()]);
+        $client->expects(self::exactly(2))->method('jetStream')->willReturnOnConsecutiveCalls($oldConnection, $newConnection);
+        $client->expects(self::once())->method('rtt')->willReturn(Future::error(new ConnectionException('Connection lost')));
+        $client->expects(self::once())->method('disconnect')->willReturn(Future::complete());
+
+        $transport = new ClockedNatsTransport(self::VALID_DSN, ['ping_after_idle' => 30]);
+        $transport->setClient($client);
+        self::assertSame([], iterator_to_array($transport->get()));
+
+        // The client still reports Open, and no time has passed: the check comes from the unanswered pull.
+        self::assertSame([], iterator_to_array($transport->get()));
+        // The server answered that pull, so the next one owes no check.
+        self::assertSame([], iterator_to_array($transport->get()));
+    }
+
+    /**
+     * A pull the server refused at the connection's subscription limit fails get() with Symfony's TransportException,
+     * which ReceiverInterface::get() declares, naming the stream, the consumer and the limit, with the client's
+     * SubscriptionLimitException as its previous one (#76). It still counts as a failure on the connection, since the
+     * server sends the same error when it closes the connection right behind it: the next operation checks the
+     * connection first, and keeps it when the PING is answered.
+     */
+    public function testPullRefusedAtTheSubscriptionLimitFailsWithATransportExceptionAndTheNextOperationChecksTheConnection(): void
+    {
+        $limit = new SubscriptionLimitException("Server sent error frame: 'maximum subscriptions exceeded'");
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('fetchBatch')->willReturnOnConsecutiveCalls(
+            Future::error($limit),
+            Future::error(new JetStreamException('JetStream pull request ended with status 408: Request Timeout', 408)),
+        );
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+        $client->expects(self::once())->method('rtt')->willReturn(Future::complete(0.001));
+        $client->expects(self::never())->method('disconnect');
+
+        $transport = new ClockedNatsTransport(self::VALID_DSN, ['ping_after_idle' => 30]);
+        $transport->setClient($client);
+
+        try {
+            iterator_to_array($transport->get());
+            self::fail('expected get() to fail');
+        } catch (TransportException $e) {
+            self::assertSame(
+                'Cannot pull from NATS stream "test-stream", consumer "client": the subscription limit was exceeded. '
+                . 'This transport requires capacity for at least two subscriptions per connection. Check server, account and user limits.',
+                $e->getMessage(),
+            );
+            self::assertSame(0, $e->getCode());
+            self::assertSame($limit, $e->getPrevious());
+        }
+
+        // The client still reports Open, and no time has passed: the check comes from the refused pull.
+        self::assertSame([], iterator_to_array($transport->get()));
+    }
+
+    /**
+     * Guard: any other client failure of a pull propagates as it is, not as a TransportException, and the next
+     * operation checks the connection, as before #76.
+     */
+    public function testPullThatFailedOnTheConnectionOtherwisePropagatesAsItIs(): void
+    {
+        $lost = new ConnectionException('Connection is not open');
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('fetchBatch')->willReturnOnConsecutiveCalls(
+            Future::error($lost),
+            Future::error(new JetStreamException('JetStream pull request ended with status 408: Request Timeout', 408)),
+        );
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+        $client->expects(self::once())->method('rtt')->willReturn(Future::complete(0.001));
+
+        $transport = new ClockedNatsTransport(self::VALID_DSN, ['ping_after_idle' => 30]);
+        $transport->setClient($client);
+
+        try {
+            iterator_to_array($transport->get());
+            self::fail('expected get() to fail');
+        } catch (\Throwable $e) {
+            self::assertSame($lost, $e);
+        }
+
+        self::assertSame([], iterator_to_array($transport->get()));
     }
 
     public function testFailureMakesNoOperationCheckTheConnectionWhenTheCheckIsOff(): void
@@ -1436,6 +1786,22 @@ final class NatsTransportTest extends TestCase
      * When the consumer lookup fails on the connection, getMessageCount() checks it before its stream-level
      * fallback, so the fallback runs on a new connection and still reports the stream's messages.
      */
+    /**
+     * Against a server that cannot be reached, the count is 0 after a single connection attempt: the stream
+     * lookup used to dial a second time, which doubled the wait (#54).
+     */
+    public function testMessageCountThatCannotConnectDialsOnceAndReturnsZero(): void
+    {
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::error(new ConnectionException('Connection refused'))]);
+        $client->expects(self::never())->method('jetStream');
+
+        $transport = new ClockedNatsTransport(self::VALID_DSN, []);
+        $transport->setClient($client);
+
+        self::assertSame(0, $transport->getMessageCount());
+    }
+
     public function testMessageCountFallbackRunsOnANewConnectionAfterTheLookupFailedOnTheOldOne(): void
     {
         $oldConnection = $this->createMock(JetStreamContext::class);
@@ -1485,6 +1851,37 @@ final class NatsTransportTest extends TestCase
     }
 
     /**
+     * A serializer that encodes every envelope to the same body.
+     */
+    private function encodingSerializer(): SerializerInterface
+    {
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('encode')->willReturn(['body' => 'encoded']);
+
+        return $serializer;
+    }
+
+    /**
+     * A JetStream context whose publish() records the subject, the headers and the Nats-Msg-Id of each call.
+     *
+     * @param list<array{subject: string, headers: array<string, string>, msgId: ?string}>|null $publishes
+     */
+    private function jetStreamRecordingPublishes(?array &$publishes): JetStreamContext
+    {
+        $publishes = [];
+        $jetStream = $this->createStub(JetStreamContext::class);
+        $jetStream->method('publish')->willReturnCallback(
+            static function (string $subject, string $payload, array $headers = [], ?string $msgId = null) use (&$publishes): Future {
+                $publishes[] = ['subject' => $subject, 'headers' => $headers, 'msgId' => $msgId];
+
+                return Future::complete();
+            },
+        );
+
+        return $jetStream;
+    }
+
+    /**
      * A client mock whose state() reports $state, which every successful connect() sets to Open, as the
      * real client does; a test closes the connection by setting $state to Closed. Each connect() returns
      * the next of $dials, and is recorded in $calls when given.
@@ -1514,6 +1911,128 @@ final class NatsTransportTest extends TestCase
         );
 
         return $client;
+    }
+
+    /**
+     * With retry_handler=nats, NATS redelivers a failed message itself once reject() NAKs it, so the copy
+     * Symfony's retry sends is not published: published as well, it retried the same failure twice, and every
+     * copy again (#47). Symfony's retry strategy is ignored in nats mode.
+     */
+    public function testNatsModeDoesNotPublishTheCopySymfonysRetrySends(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::never())->method('publish');
+        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer->expects(self::never())->method('encode');
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['retry_handler' => 'nats'], $serializer);
+        $transport->setJetStreamContext($jetStream);
+        $retry = new Envelope(new \stdClass(), [new ReceivedStamp('async'), new DelayStamp(1000), new RedeliveryStamp(1)]);
+
+        self::assertSame($retry, $transport->send($retry));
+    }
+
+    /**
+     * Only in nats mode: with the default retry_handler=symfony, Symfony's retry copy is the retry.
+     */
+    public function testSymfonyModePublishesTheCopySymfonysRetrySends(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('publish')->willReturn(Future::complete());
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('encode')->willReturn(['body' => 'encoded']);
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $serializer);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->send(new Envelope(new \stdClass(), [new ReceivedStamp('async'), new DelayStamp(1000), new RedeliveryStamp(1)]));
+    }
+
+    /**
+     * In nats mode a copy for the failure transport (retry count 0) and a message that was not received in
+     * this process are still published: only Symfony's retry copy is left out.
+     *
+     * @param list<\Symfony\Component\Messenger\Stamp\StampInterface> $stamps
+     */
+    #[DataProvider('envelopesNatsModeStillPublishes')]
+    public function testNatsModeStillPublishesWhatIsNotSymfonysRetryCopy(array $stamps): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('publish')->willReturn(Future::complete());
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('encode')->willReturn(['body' => 'encoded']);
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['retry_handler' => 'nats'], $serializer);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->send(new Envelope(new \stdClass(), $stamps));
+    }
+
+    /**
+     * @return iterable<string, array{list<\Symfony\Component\Messenger\Stamp\StampInterface>}>
+     */
+    public static function envelopesNatsModeStillPublishes(): iterable
+    {
+        yield 'copy for the failure transport' => [[
+            new ReceivedStamp('async'),
+            new SentToFailureTransportStamp('async'),
+            new DelayStamp(0),
+            new RedeliveryStamp(0),
+        ]];
+        yield 'message not received in this process' => [[new RedeliveryStamp(1)]];
+        yield 'plain dispatch' => [[]];
+    }
+
+    /**
+     * Through Symfony's own Worker and retry listener, with the retry strategy FrameworkBundle gives every
+     * transport (3 retries): a delivery that fails in nats mode is NAKed for NATS to redeliver, and no copy is
+     * published beside it.
+     */
+    public function testWorkerRetryInNatsModeNaksTheOriginalWithoutPublishingACopy(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->method('fetchBatch')->willReturn(Future::complete([
+            new NatsMessage(subject: 'test-topic', sid: 1, replyTo: '$JS.ACK.test-stream.client.1.1.1.0.0', payload: 'encoded'),
+        ]));
+        $jetStream->expects(self::never())->method('publish');
+        $jetStream->expects(self::never())->method('term');
+        $jetStream->expects(self::once())->method('nak')->willReturn(Future::complete());
+
+        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer->method('decode')->willReturn(new Envelope(new \stdClass()));
+        $serializer->expects(self::never())->method('encode');
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['retry_handler' => 'nats'], $serializer);
+        $transport->setJetStreamContext($jetStream);
+
+        $bus = new MessageBus([new HandleMessageMiddleware(new HandlersLocator([
+            \stdClass::class => [static function (): void {
+                throw new \RuntimeException('always fails');
+            }],
+        ]))]);
+        $locator = static fn (object $service): ContainerInterface => new class ($service) implements ContainerInterface {
+            public function __construct(private object $service)
+            {
+            }
+
+            public function get(string $id): object
+            {
+                return $this->service;
+            }
+
+            public function has(string $id): bool
+            {
+                return true;
+            }
+        };
+        $dispatcher = new EventDispatcher();
+        $dispatcher->addSubscriber(new SendFailedMessageForRetryListener(
+            $locator($transport),
+            $locator(new MultiplierRetryStrategy(3, 1000, 2)),
+        ));
+        $dispatcher->addSubscriber(new StopWorkerOnMessageLimitListener(1));
+
+        (new Worker(['async' => $transport], $bus, $dispatcher))->run(['sleep' => 0]);
     }
 
     public function testJetStreamThrowsWhenConnectLeavesContextUnavailable(): void
@@ -1614,6 +2133,29 @@ final class NatsTransportTest extends TestCase
         $transport->setJetStreamContext($jetStream);
 
         self::assertSame(7, $transport->getMessageCount());
+    }
+
+    /**
+     * A stream state without a message count, as in a partial server response, counts as 0.
+     */
+    public function testGetMessageCountReadsAStreamStateWithoutAMessageCountAsZero(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('getConsumer')
+            ->willReturn(Future::error(new JetStreamException('consumer not found', 404)));
+        $jetStream->expects(self::once())
+            ->method('getStream')
+            ->willReturn(Future::complete(new StreamInfo(
+                name: 'test-stream',
+                subjects: ['test-topic'],
+                raw: ['state' => [], 'config' => ['name' => 'test-stream', 'subjects' => ['test-topic']]],
+            )));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        self::assertSame(0, $transport->getMessageCount());
     }
 
     public function testGetMessageCountReturnsZeroWhenLookupsFail(): void
@@ -2018,7 +2560,7 @@ final class NatsTransportTest extends TestCase
 
     public function testAutoSetupProvisionsOnFirstSendOnce(): void
     {
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
 
         $jetStream = $this->createMock(JetStreamContext::class);
@@ -2071,7 +2613,7 @@ final class NatsTransportTest extends TestCase
 
     public function testAutoSetupDisabledByDefaultDoesNotProvisionOnSend(): void
     {
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
 
         $jetStream = $this->createMock(JetStreamContext::class);
@@ -2089,13 +2631,13 @@ final class NatsTransportTest extends TestCase
 
     public function testAutoSetupProvisionsBeforeTheFirstPublish(): void
     {
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
 
         // Recording the order matters: provisioning that runs *after* the publish would still satisfy
         // simple call-count expectations while defeating the entire point of auto_setup.
         $calls = [];
-        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream = $this->createStub(JetStreamContext::class);
         $jetStream->method('addStream')->willReturnCallback(static function () use (&$calls) {
             $calls[] = 'addStream';
 
@@ -2128,7 +2670,7 @@ final class NatsTransportTest extends TestCase
     public function testAutoSetupProvisionsBeforeTheFirstFetch(): void
     {
         $calls = [];
-        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream = $this->createStub(JetStreamContext::class);
         $jetStream->method('addStream')->willReturnCallback(static function () use (&$calls) {
             $calls[] = 'addStream';
 
@@ -2160,7 +2702,7 @@ final class NatsTransportTest extends TestCase
 
     public function testAutoSetupRetriesProvisioningAfterAFailedAttempt(): void
     {
-        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer = $this->createStub(SerializerInterface::class);
         $serializer->method('encode')->willReturn(['body' => 'encoded']);
 
         $jetStream = $this->createMock(JetStreamContext::class);
@@ -2297,6 +2839,100 @@ final class NatsTransportTest extends TestCase
         $this->expectExceptionMessage('backend unavailable');
 
         iterator_to_array($transport->get());
+    }
+
+    /**
+     * The second pull after auto_setup provisioned the consumer again gets the same treatment as the first (#76): a
+     * refusal at the subscription limit fails get() with the TransportException naming the limit.
+     */
+    public function testAutoSetupRetriedPullRefusedAtTheSubscriptionLimitFailsWithATransportException(): void
+    {
+        $consumerInfo = new ConsumerInfo(
+            streamName: 'test-stream',
+            name: 'client',
+            push: false,
+            raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+        );
+        $limit = new SubscriptionLimitException("Server sent error frame: 'maximum subscriptions exceeded'");
+
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::exactly(2))->method('addConsumer')->willReturn(Future::complete($consumerInfo));
+        $jetStream->expects(self::exactly(2))
+            ->method('fetchBatch')
+            ->willReturnOnConsecutiveCalls(
+                Future::error(new JetStreamException('consumer not found', 503)),
+                Future::error($limit),
+            );
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['auto_setup' => true]);
+        $transport->setJetStreamContext($jetStream);
+
+        try {
+            iterator_to_array($transport->get());
+            self::fail('expected get() to fail');
+        } catch (TransportException $e) {
+            self::assertSame(
+                'Cannot pull from NATS stream "test-stream", consumer "client": the subscription limit was exceeded. '
+                . 'This transport requires capacity for at least two subscriptions per connection. Check server, account and user limits.',
+                $e->getMessage(),
+            );
+            self::assertSame($limit, $e->getPrevious());
+        }
+    }
+
+    /**
+     * Only a status that can mean a missing stream or consumer calls for provisioning again: any other error
+     * from the pull propagates as it is.
+     */
+    public function testAutoSetupDoesNotReprovisionForAnUnexpectedPullError(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        // Once, for the first use.
+        $jetStream->expects(self::once())->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::once())->method('addConsumer')->willReturn(Future::complete(new ConsumerInfo(
+            streamName: 'test-stream',
+            name: 'client',
+            push: false,
+            raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+        )));
+        $jetStream->expects(self::once())
+            ->method('fetchBatch')
+            ->willReturn(Future::error(new JetStreamException('backend unavailable', 500)));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['auto_setup' => true]);
+        $transport->setJetStreamContext($jetStream);
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('backend unavailable');
+
+        iterator_to_array($transport->get());
+    }
+
+    /**
+     * After provisioning again, a retried pull that found no messages (408) is an empty batch, not an error.
+     */
+    public function testAutoSetupReadsA408FromTheRetriedPullAsEmpty(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::exactly(2))->method('addConsumer')->willReturn(Future::complete(new ConsumerInfo(
+            streamName: 'test-stream',
+            name: 'client',
+            push: false,
+            raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+        )));
+        $jetStream->expects(self::exactly(2))
+            ->method('fetchBatch')
+            ->willReturnOnConsecutiveCalls(
+                Future::error(new JetStreamException('JetStream pull request ended with status 503', 503)),
+                Future::error(new JetStreamException('JetStream pull request ended with status 408: Request Timeout', 408)),
+            );
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['auto_setup' => true]);
+        $transport->setJetStreamContext($jetStream);
+
+        self::assertSame([], array_values(iterator_to_array($transport->get())));
     }
 
     #[DataProvider('missingResourceStatusProvider')]
@@ -2695,6 +3331,33 @@ final class NatsTransportTest extends TestCase
         $transport->setup();
     }
 
+    /**
+     * With scheduled_messages on, a server that rejects some other feature gets the message that names that
+     * feature, not the one about scheduled messages. The exception keeps the client's as its previous one.
+     */
+    public function testSetupNamesTheRejectedFeatureWhenItIsNotTheOneScheduledMessagesNeed(): void
+    {
+        $unsupported = new UnsupportedFeatureException('allow_atomic', '2.12', '2.11.0', 'unknown field "allow_atomic"', 400);
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('addStream')->willReturn(Future::error($unsupported));
+        $jetStream->expects(self::never())->method('addConsumer');
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['scheduled_messages' => true]);
+        $transport->setJetStreamContext($jetStream);
+
+        try {
+            $transport->setup();
+            self::fail('setup() was expected to fail.');
+        } catch (\RuntimeException $exception) {
+            self::assertSame(
+                "NATS Server feature 'allow_atomic' requires version >= 2.12, but the connected server reports 2.11.0.",
+                $exception->getMessage(),
+            );
+            self::assertSame(0, $exception->getCode());
+            self::assertSame($unsupported, $exception->getPrevious());
+        }
+    }
+
     public function testSetupWrapsUnexpectedStreamCreationErrors(): void
     {
         $jetStream = $this->createMock(JetStreamContext::class);
@@ -2991,6 +3654,7 @@ final class NatsTransportTest extends TestCase
 
         $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $serializer);
         $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::never())->method('publish');
         $transport->setJetStreamContext($jetStream);
 
         $envelope = new Envelope(new \stdClass());
@@ -3103,14 +3767,18 @@ final class NatsTransportTest extends TestCase
         $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['scheduled_messages' => true], $serializer);
         $transport->setJetStreamContext($jetStream);
 
-        // A sub-second delay must NOT collapse to "now": the @at second resolution is rounded up, so a
-        // 300ms delay still schedules at a strictly future whole second rather than firing immediately.
-        $before = microtime(true);
-        $transport->send(new Envelope(new \stdClass(), [new DelayStamp(300)]));
+        // A delay of a second or less must NOT collapse to "now": the @at schedule has whole-second
+        // resolution, and the delivery time is rounded up to it. The delay is picked so that the requested
+        // time falls in the middle of a second, where rounding up and cutting the fraction off give different
+        // seconds, so the check holds whatever the clock reads when the test starts.
+        $now = new \DateTimeImmutable();
+        $delayMs = 1 + (1499 - intdiv((int) $now->format('u'), 1000)) % 1000;
+        $requested = $now->modify(sprintf('+%d milliseconds', $delayMs));
+        $transport->send(new Envelope(new \stdClass(), [new DelayStamp($delayMs)]));
 
         self::assertArrayHasKey('Nats-Schedule', $capturedHeaders);
-        $scheduled = (new \DateTimeImmutable(substr($capturedHeaders['Nats-Schedule'], 4)))->getTimestamp();
-        self::assertGreaterThan($before, $scheduled, 'A sub-second delay must still schedule in the future, not immediately.');
+        $scheduled = new \DateTimeImmutable(substr($capturedHeaders['Nats-Schedule'], 4));
+        self::assertGreaterThanOrEqual($requested, $scheduled, 'A short delay must not be scheduled before it has elapsed.');
     }
 
     public function testSendDelayedMessageWithLargeDelaySchedulesFarInTheFuture(): void
@@ -3219,6 +3887,149 @@ final class NatsTransportTest extends TestCase
         self::assertInstanceOf(TransportMessageIdStamp::class, $result->last(TransportMessageIdStamp::class));
     }
 
+    /**
+     * With deduplicate, a message gets an id on its first send, its transport message id. The id is encoded
+     * with the message, so that it travels with it, and is published as its Nats-Msg-Id with the retry count
+     * (#53).
+     */
+    public function testSendWithDeduplicationStampsTheEnvelopeAndPublishesItsMessageId(): void
+    {
+        $encoded = null;
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('encode')->willReturnCallback(static function (Envelope $envelope) use (&$encoded): array {
+            $encoded = $envelope;
+
+            return ['body' => 'encoded'];
+        });
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['deduplicate' => true], $serializer);
+        $transport->setJetStreamContext($this->jetStreamRecordingPublishes($publishes));
+
+        $sent = $transport->send(new Envelope(new \stdClass()));
+
+        $id = $sent->last(TransportMessageIdStamp::class)?->getId();
+        self::assertNotNull($id);
+        self::assertSame($id, $sent->last(DeduplicationIdStamp::class)?->id);
+        self::assertInstanceOf(Envelope::class, $encoded);
+        self::assertSame($id, $encoded->last(DeduplicationIdStamp::class)?->id, 'The id must be encoded with the message.');
+        self::assertSame([$id . ':test-topic:0'], array_column($publishes, 'msgId'));
+    }
+
+    /**
+     * A copy sent again keeps the id it carries, such as Symfony's retry of a received message, instead of
+     * getting a new one, so that JetStream can drop it.
+     */
+    public function testSendKeepsTheDeduplicationIdTheEnvelopeCarries(): void
+    {
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['deduplicate' => true], $this->encodingSerializer());
+        $transport->setJetStreamContext($this->jetStreamRecordingPublishes($publishes));
+
+        $sent = $transport->send(new Envelope(new \stdClass(), [new DeduplicationIdStamp('order-42')]));
+
+        self::assertCount(1, $sent->all(DeduplicationIdStamp::class));
+        self::assertSame(['order-42:test-topic:0'], array_column($publishes, 'msgId'));
+    }
+
+    /**
+     * Each of Symfony's retries is a message of its own, and so is the copy for a failure transport, which
+     * Symfony sends with a retry count of 0, like the original.
+     */
+    public function testSendGivesEachRetryAndTheFailureTransportCopyAMessageIdOfItsOwn(): void
+    {
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['deduplicate' => true], $this->encodingSerializer());
+        $transport->setJetStreamContext($this->jetStreamRecordingPublishes($publishes));
+        $original = new Envelope(new \stdClass(), [new DeduplicationIdStamp('order-42')]);
+
+        $transport->send($original);
+        $transport->send($original->with(new RedeliveryStamp(1)));
+        $transport->send($original->with(new RedeliveryStamp(2)));
+        $transport->send($original->with(new SentToFailureTransportStamp('async'), new RedeliveryStamp(0)));
+
+        self::assertSame(['order-42:test-topic:0', 'order-42:test-topic:1', 'order-42:test-topic:2', 'order-42:test-topic:0:failed:async'], array_column($publishes, 'msgId'));
+    }
+
+    /**
+     * Off by default: no id is added, and nothing is deduplicated.
+     */
+    public function testSendWithoutDeduplicationSendsNoMessageIdAndAddsNoStamp(): void
+    {
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $this->encodingSerializer());
+        $transport->setJetStreamContext($this->jetStreamRecordingPublishes($publishes));
+
+        $sent = $transport->send(new Envelope(new \stdClass()));
+
+        self::assertNull($sent->last(DeduplicationIdStamp::class));
+        self::assertSame([null], array_column($publishes, 'msgId'));
+    }
+
+    /**
+     * An id the application adds itself is used with the option off as well: it asked for it.
+     */
+    public function testSendUsesAnApplicationDeduplicationIdWithTheOptionOff(): void
+    {
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $this->encodingSerializer());
+        $transport->setJetStreamContext($this->jetStreamRecordingPublishes($publishes));
+
+        $transport->send(new Envelope(new \stdClass(), [new DeduplicationIdStamp('order-42')]));
+
+        self::assertSame(['order-42:test-topic:0'], array_column($publishes, 'msgId'));
+    }
+
+    /**
+     * A delayed message keeps its id too: NATS does not pass the Nats-Msg-Id on to the message it delivers at
+     * the scheduled time, so the delivery cannot be taken for a duplicate (measured on 2.12 and 2.14).
+     */
+    public function testSendDelayedMessageWithDeduplicationPublishesItsMessageId(): void
+    {
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['deduplicate' => true, 'scheduled_messages' => true], $this->encodingSerializer());
+        $transport->setJetStreamContext($this->jetStreamRecordingPublishes($publishes));
+
+        $sent = $transport->send(new Envelope(new \stdClass(), [new DelayStamp(5000)]));
+
+        $id = $sent->last(DeduplicationIdStamp::class)?->id;
+        self::assertNotNull($id);
+        self::assertCount(1, $publishes);
+        self::assertSame('test-topic.delayed.' . $id, $publishes[0]['subject']);
+        self::assertArrayHasKey('Nats-Schedule', $publishes[0]['headers']);
+        self::assertSame($id . ':test-topic:0', $publishes[0]['msgId']);
+    }
+
+    /**
+     * Symfony hands each transport a message is routed to the envelope the one before returned, deduplication
+     * id included. JetStream deduplicates per stream whatever the subject, so two transports on one stream
+     * dropped the second copy; the subject keeps their ids apart.
+     */
+    public function testSendGivesTheCopiesForTwoTransportsOnOneStreamMessageIdsOfTheirOwn(): void
+    {
+        $orders = new RuntimeTestableNatsTransport('nats://localhost:4222/events/events.orders', ['deduplicate' => true], $this->encodingSerializer());
+        $orders->setJetStreamContext($this->jetStreamRecordingPublishes($ordersPublishes));
+        $payments = new RuntimeTestableNatsTransport('nats://localhost:4222/events/events.payments', [], $this->encodingSerializer());
+        $payments->setJetStreamContext($this->jetStreamRecordingPublishes($paymentsPublishes));
+
+        $sent = $payments->send($orders->send(new Envelope(new \stdClass())));
+
+        $id = $sent->last(DeduplicationIdStamp::class)?->id;
+        self::assertNotNull($id);
+        self::assertSame([$id . ':events.orders:0'], array_column($ordersPublishes, 'msgId'));
+        self::assertSame([$id . ':events.payments:0'], array_column($paymentsPublishes, 'msgId'));
+    }
+
+    /**
+     * A message routed to two transports that fails on both reaches a shared failure transport twice, with
+     * the same deduplication id and retry count: the transport it failed on keeps the two copies apart.
+     */
+    public function testSendGivesTheFailureCopiesOfTwoTransportsMessageIdsOfTheirOwn(): void
+    {
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['deduplicate' => true], $this->encodingSerializer());
+        $transport->setJetStreamContext($this->jetStreamRecordingPublishes($publishes));
+        $failed = new Envelope(new \stdClass(), [new DeduplicationIdStamp('order-42'), new RedeliveryStamp(0)]);
+
+        $transport->send($failed->with(new SentToFailureTransportStamp('orders')));
+        $transport->send($failed->with(new SentToFailureTransportStamp('payments')));
+
+        self::assertSame(['order-42:test-topic:0:failed:orders', 'order-42:test-topic:0:failed:payments'], array_column($publishes, 'msgId'));
+    }
+
     public function testSendWithZeroDelayPublishesNormally(): void
     {
         $serializer = $this->createMock(SerializerInterface::class);
@@ -3239,6 +4050,27 @@ final class NatsTransportTest extends TestCase
         $result = $transport->send($envelope);
 
         self::assertInstanceOf(TransportMessageIdStamp::class, $result->last(TransportMessageIdStamp::class));
+    }
+
+    /**
+     * With scheduled_messages on, a message without a DelayStamp goes to the topic at once, with no schedule
+     * headers.
+     */
+    public function testSendWithoutDelayStampPublishesNormallyWhenScheduledMessagesAreEnabled(): void
+    {
+        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer->expects(self::once())->method('encode')->willReturn(['body' => 'encoded-payload']);
+
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('publish')
+            ->with('test-topic', 'encoded-payload', [])
+            ->willReturn(Future::complete());
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['scheduled_messages' => true], $serializer);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->send(new Envelope(new \stdClass()));
     }
 
     public function testSetupWithScheduledMessagesAddsDelayedSubjectAndFlag(): void
@@ -3436,15 +4268,9 @@ final class NatsTransportTest extends TestCase
             ->method('updateStream')
             // scheduled_messages is off, so the transport-managed '{topic}.delayed.>' subject left over
             // from a previous run must be dropped, while the plain topic and any operator-added subject
-            // are preserved.
-            ->with('test-stream', self::callback(static function (array $options): bool {
-                $subjects = $options['subjects'] ?? [];
-
-                return is_array($subjects)
-                    && !in_array('test-topic.delayed.>', $subjects, true)
-                    && in_array('test-topic', $subjects, true)
-                    && in_array('operator.added', $subjects, true);
-            }))
+            // are preserved. What is left must still be a list: with a gap in its keys it would be sent as
+            // a JSON object, which the server rejects.
+            ->with('test-stream', self::callback(static fn (array $options): bool => ($options['subjects'] ?? null) === ['test-topic', 'operator.added']))
             ->willReturn(Future::complete());
         $jetStream->expects(self::once())
             ->method('addConsumer')
@@ -3657,6 +4483,42 @@ final class NatsTransportTest extends TestCase
 
         $transport->setup();
 
+    }
+
+    /**
+     * A configured stream_max_bytes replaces the existing stream's limit on update.
+     */
+    public function testSetupUpdatesExistingStreamWithMaxBytes(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $streamInfo = new StreamInfo(
+            name: 'test-stream',
+            subjects: ['test-topic'],
+            raw: ['config' => ['name' => 'test-stream', 'subjects' => ['test-topic'], 'storage' => 'file', 'max_bytes' => 1024]],
+        );
+        $jetStream->expects(self::once())
+            ->method('addStream')
+            ->willReturn(Future::error(new JetStreamException('already exists', 0)));
+        $jetStream->expects(self::once())
+            ->method('getStream')
+            ->willReturn(Future::complete($streamInfo));
+        $jetStream->expects(self::once())
+            ->method('updateStream')
+            ->with('test-stream', self::callback(static fn (array $options): bool => ($options['max_bytes'] ?? null) === 2048))
+            ->willReturn(Future::complete());
+        $jetStream->expects(self::once())
+            ->method('addConsumer')
+            ->willReturn(Future::complete(new ConsumerInfo(
+                streamName: 'test-stream',
+                name: 'client',
+                push: false,
+                raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+            )));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['stream_max_bytes' => 2048]);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->setup();
     }
 
     public function testSetupCreatesNewStreamWithMaxMessagesPerSubject(): void
@@ -4169,6 +5031,52 @@ final class NatsTransportTest extends TestCase
         $transport->setup();
     }
 
+    /**
+     * Subjects in the server's config that are not non-empty strings are left out of the update, and the
+     * subjects sent back are a list, which JSON encodes as an array, with scheduled messages on or off.
+     *
+     * @param list<string> $expected
+     */
+    #[DataProvider('subjectsAfterCleaningServerSubjects')]
+    public function testSetupUpdateLeavesOutServerSubjectsThatAreNotNonEmptyStrings(bool $scheduledMessages, array $expected): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('addStream')
+            ->willReturn(Future::error(new JetStreamException('already exists', 0)));
+        $jetStream->expects(self::once())
+            ->method('getStream')
+            ->willReturn(Future::complete(StreamInfo::fromArray([
+                'config' => ['name' => 'test-stream', 'subjects' => [42, '', 'operator.added'], 'storage' => 'file'],
+            ])));
+        $jetStream->expects(self::once())
+            ->method('updateStream')
+            ->with('test-stream', self::callback(static fn (array $options): bool => ($options['subjects'] ?? null) === $expected))
+            ->willReturn(Future::complete());
+        $jetStream->expects(self::once())
+            ->method('addConsumer')
+            ->willReturn(Future::complete(new ConsumerInfo(
+                streamName: 'test-stream',
+                name: 'client',
+                push: false,
+                raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+            )));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['scheduled_messages' => $scheduledMessages]);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->setup();
+    }
+
+    /**
+     * @return iterable<string, array{bool, list<string>}>
+     */
+    public static function subjectsAfterCleaningServerSubjects(): iterable
+    {
+        yield 'scheduled messages off' => [false, ['operator.added', 'test-topic']];
+        yield 'scheduled messages on' => [true, ['operator.added', 'test-topic', 'test-topic.delayed.>']];
+    }
+
     public function testGetDecodeFailureUsesNakWhenRetryHandlerIsNats(): void
     {
         $serializer = $this->createMock(SerializerInterface::class);
@@ -4259,6 +5167,29 @@ final class NatsTransportTest extends TestCase
         $this->expectExceptionMessage("Failed to setup NATS stream 'test-stream': consumer creation failed");
 
         $transport->setup();
+    }
+
+    /**
+     * A failed setup keeps the failure as its previous exception and does not take over its code.
+     */
+    public function testSetupFailureKeepsTheCauseAsThePreviousException(): void
+    {
+        $cause = new JetStreamException('consumer creation failed', 500);
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::once())->method('addConsumer')->willReturn(Future::error($cause));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        try {
+            $transport->setup();
+            self::fail('setup() was expected to fail.');
+        } catch (\RuntimeException $exception) {
+            self::assertSame("Failed to setup NATS stream 'test-stream': consumer creation failed", $exception->getMessage());
+            self::assertSame(0, $exception->getCode());
+            self::assertSame($cause, $exception->getPrevious());
+        }
     }
 
     public function testConstructorWithTlsDsnInitializesTransport(): void
@@ -4355,5 +5286,1049 @@ final class NatsTransportTest extends TestCase
         $result = $transport->send($envelope);
 
         self::assertInstanceOf(TransportMessageIdStamp::class, $result->last(TransportMessageIdStamp::class));
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     * @param array<string, mixed> $expectedPlacement
+     */
+    #[DataProvider('streamPlacementProvider')]
+    public function testSetupPassesStreamPlacementOnCreate(array $options, array $expectedPlacement): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('addStream')
+            ->with(self::streamConfigEquals([
+                'storage' => 'file',
+                'num_replicas' => 1,
+                'placement' => $expectedPlacement,
+                'name' => 'test-stream',
+                'subjects' => ['test-topic'],
+            ]))
+            ->willReturn(Future::complete());
+        $jetStream->expects(self::once())
+            ->method('addConsumer')
+            ->willReturn(Future::complete(new ConsumerInfo(
+                streamName: 'test-stream',
+                name: 'client',
+                push: false,
+                raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+            )));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, $options);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->setup();
+    }
+
+    /**
+     * @return iterable<string, array{array<string, mixed>, array<string, mixed>}>
+     */
+    public static function streamPlacementProvider(): iterable
+    {
+        yield 'cluster and tags' => [
+            ['stream_placement_cluster' => 'east', 'stream_placement_tags' => ['ssd', 'fast']],
+            ['cluster' => 'east', 'tags' => ['ssd', 'fast']],
+        ];
+        yield 'tags only, comma-separated' => [
+            ['stream_placement_tags' => 'ssd,fast'],
+            ['tags' => ['ssd', 'fast']],
+        ];
+        yield 'cluster only' => [
+            ['stream_placement_cluster' => 'east'],
+            ['cluster' => 'east'],
+        ];
+    }
+
+    public function testSetupUpdateAppliesConfiguredStreamPlacementToAnExistingStream(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $streamInfo = new StreamInfo(
+            name: 'test-stream',
+            subjects: ['test-topic'],
+            raw: [
+                'config' => [
+                    'name' => 'test-stream',
+                    'subjects' => ['test-topic'],
+                    'storage' => 'file',
+                    'placement' => ['cluster' => 'west'],
+                ],
+            ],
+        );
+
+        $jetStream->expects(self::once())
+            ->method('addStream')
+            ->willReturn(Future::error(new JetStreamException('already exists', 0)));
+        $jetStream->expects(self::once())
+            ->method('getStream')
+            ->with('test-stream')
+            ->willReturn(Future::complete($streamInfo));
+        $jetStream->expects(self::once())
+            ->method('updateStream')
+            ->with('test-stream', self::callback(static function (array $options): bool {
+                return ($options['placement'] ?? null) === ['cluster' => 'east', 'tags' => ['ssd']];
+            }))
+            ->willReturn(Future::complete());
+        $jetStream->expects(self::once())
+            ->method('addConsumer')
+            ->willReturn(Future::complete(new ConsumerInfo(
+                streamName: 'test-stream',
+                name: 'client',
+                push: false,
+                raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+            )));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [
+            'stream_placement_cluster' => 'east',
+            'stream_placement_tags' => ['ssd'],
+        ]);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->setup();
+    }
+
+    /**
+     * A STREAM.UPDATE payload that omits `placement` clears it on the server (verified against
+     * nats-server 2.14), so an operator-pinned placement survives only because the transport echoes
+     * the live value back whenever the placement options are unset.
+     */
+    public function testSetupUpdatePreservesServerStreamPlacementWhenNotConfigured(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $streamInfo = new StreamInfo(
+            name: 'test-stream',
+            subjects: ['test-topic'],
+            raw: [
+                'config' => [
+                    'name' => 'test-stream',
+                    'subjects' => ['test-topic'],
+                    'storage' => 'file',
+                    'placement' => ['tags' => ['hdd']],
+                ],
+            ],
+        );
+
+        $jetStream->expects(self::once())
+            ->method('addStream')
+            ->willReturn(Future::error(new JetStreamException('already exists', 0)));
+        $jetStream->expects(self::once())
+            ->method('getStream')
+            ->with('test-stream')
+            ->willReturn(Future::complete($streamInfo));
+        $jetStream->expects(self::once())
+            ->method('updateStream')
+            ->with('test-stream', self::callback(static function (array $options): bool {
+                return ($options['placement'] ?? null) === ['tags' => ['hdd']];
+            }))
+            ->willReturn(Future::complete());
+        $jetStream->expects(self::once())
+            ->method('addConsumer')
+            ->willReturn(Future::complete(new ConsumerInfo(
+                streamName: 'test-stream',
+                name: 'client',
+                push: false,
+                raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+            )));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->setup();
+    }
+
+    /**
+     * The update path merges the configured placement fields into the live block instead of replacing
+     * it: one option never wipes the field the other half of an operator's placement holds, and tags
+     * that name the live set in another order keep the live array as the server stores it, because
+     * nats-server reads any difference in the block, even a reordered list, as a request to move the
+     * stream. The comparison is case-sensitive on purpose (see the transport's doc-comment), so a tag
+     * that differs only in case is a change.
+     *
+     * @param array<string, mixed>|null $livePlacement     `placement` of the live stream config, null for none
+     * @param array<string, mixed>      $options           Transport options
+     * @param array<string, mixed>|null $expectedPlacement `placement` the update must carry, null for none
+     * @param array<string, mixed>      $expectedFields    Other fields the update must carry, by key
+     */
+    #[DataProvider('mergedPlacementProvider')]
+    public function testSetupUpdateMergesConfiguredPlacementIntoTheLivePlacement(
+        ?array $livePlacement,
+        array $options,
+        ?array $expectedPlacement,
+        array $expectedFields = [],
+    ): void {
+        $liveConfiguration = [
+            'name' => 'test-stream',
+            'subjects' => ['test-topic'],
+            'storage' => 'file',
+            'num_replicas' => 1,
+        ];
+        if ($livePlacement !== null) {
+            $liveConfiguration['placement'] = $livePlacement;
+        }
+
+        $payload = $this->captureStreamUpdatePayload($liveConfiguration, $options);
+
+        if ($expectedPlacement === null) {
+            self::assertArrayNotHasKey('placement', $payload);
+        } else {
+            self::assertSame($expectedPlacement, $payload['placement'] ?? null);
+        }
+        foreach ($expectedFields as $field => $value) {
+            self::assertSame($value, $payload[$field] ?? null, $field);
+        }
+    }
+
+    /**
+     * @return iterable<string, array{array<string, mixed>|null, array<string, mixed>, array<string, mixed>|null, 3?: array<string, mixed>}>
+     */
+    public static function mergedPlacementProvider(): iterable
+    {
+        $pinned = ['cluster' => 'east', 'tags' => ['hdd']];
+
+        yield 'tags only keep the live cluster' => [
+            $pinned, ['stream_placement_tags' => 'ssd'], ['cluster' => 'east', 'tags' => ['ssd']],
+        ];
+        yield 'cluster only keeps the live tags' => [
+            $pinned, ['stream_placement_cluster' => 'west'], ['cluster' => 'west', 'tags' => ['hdd']],
+        ];
+        yield 'a cluster equal to the live one keeps the live tags' => [
+            $pinned, ['stream_placement_cluster' => 'east'], $pinned,
+        ];
+        yield 'both options replace both fields' => [
+            $pinned,
+            ['stream_placement_cluster' => 'west', 'stream_placement_tags' => ['ssd']],
+            ['cluster' => 'west', 'tags' => ['ssd']],
+        ];
+        yield 'both options equal to the live block leave it as it is' => [
+            ['cluster' => 'west', 'tags' => ['ssd']],
+            ['stream_placement_cluster' => 'west', 'stream_placement_tags' => ['ssd']],
+            ['cluster' => 'west', 'tags' => ['ssd']],
+        ];
+        yield 'no option echoes the live block, fields the transport does not know included' => [
+            ['cluster' => 'east', 'tags' => ['hdd'], 'preferred' => 'n1'],
+            [],
+            ['cluster' => 'east', 'tags' => ['hdd'], 'preferred' => 'n1'],
+        ];
+        yield 'tags only on a stream without placement' => [
+            null, ['stream_placement_tags' => 'ssd'], ['tags' => ['ssd']],
+        ];
+        yield 'cluster only on a stream without placement' => [
+            null, ['stream_placement_cluster' => 'west'], ['cluster' => 'west'],
+        ];
+        yield 'no option on a stream without placement sends none' => [
+            null, [], null,
+        ];
+        yield 'a changed tag set replaces the whole list' => [
+            ['tags' => ['ssd', 'eu']], ['stream_placement_tags' => 'ssd,nvme'], ['tags' => ['ssd', 'nvme']],
+        ];
+        yield 'the same tags in another order keep the live array' => [
+            ['tags' => ['ssd', 'eu']], ['stream_placement_tags' => 'eu,ssd'], ['tags' => ['ssd', 'eu']],
+        ];
+        yield 'a repeated live tag is kept as the server stores it' => [
+            ['tags' => ['ssd', 'ssd', 'eu']], ['stream_placement_tags' => 'eu,ssd'], ['tags' => ['ssd', 'ssd', 'eu']],
+        ];
+        yield 'a changed cluster with the same tags in another order' => [
+            ['cluster' => 'east', 'tags' => ['ssd', 'eu']],
+            ['stream_placement_cluster' => 'west', 'stream_placement_tags' => 'eu,ssd'],
+            ['cluster' => 'west', 'tags' => ['ssd', 'eu']],
+        ];
+        yield 'a tag that differs only in case is a change' => [
+            ['tags' => ['!zone:unused']], ['stream_placement_tags' => '!ZONE:unused'], ['tags' => ['!ZONE:unused']],
+        ];
+        yield 'live tags that are not strings are replaced' => [
+            ['tags' => ['ssd', 7]], ['stream_placement_tags' => 'ssd,7'], ['tags' => ['ssd', '7']],
+        ];
+        yield 'a live tag that is not a string never matches, not even next to its string form' => [
+            ['tags' => ['7', 7]], ['stream_placement_tags' => '7'], ['tags' => ['7']],
+        ];
+        yield 'the same tags in another order keep the live array when the live side is the sorted one' => [
+            ['tags' => ['eu', 'ssd']], ['stream_placement_tags' => 'ssd,eu'], ['tags' => ['eu', 'ssd']],
+        ];
+        yield 'the same tags in another order with a replica change, and no cluster pin made up' => [
+            ['tags' => ['ssd', 'eu']],
+            ['stream_placement_tags' => 'eu,ssd', 'stream_replicas' => 3],
+            ['tags' => ['ssd', 'eu']],
+            ['num_replicas' => 3],
+        ];
+    }
+
+    /**
+     * Runs setup() against a stream that already exists with the given live configuration and returns
+     * the STREAM.UPDATE payload the transport sent for it.
+     *
+     * @param array<string, mixed> $liveConfiguration
+     * @param array<string, mixed> $options
+     * @return array<string, mixed>
+     */
+    private function captureStreamUpdatePayload(array $liveConfiguration, array $options): array
+    {
+        $payload = null;
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('addStream')
+            ->willReturn(Future::error(new JetStreamException('already exists', 0)));
+        $jetStream->expects(self::once())
+            ->method('getStream')
+            ->with('test-stream')
+            ->willReturn(Future::complete(new StreamInfo(
+                name: 'test-stream',
+                subjects: ['test-topic'],
+                raw: ['config' => $liveConfiguration],
+            )));
+        $jetStream->expects(self::once())
+            ->method('updateStream')
+            ->with('test-stream', self::callback(static function (array $options) use (&$payload): bool {
+                $payload = $options;
+
+                return true;
+            }))
+            ->willReturn(Future::complete());
+        $jetStream->expects(self::once())
+            ->method('addConsumer')
+            ->willReturn(Future::complete(new ConsumerInfo(
+                streamName: 'test-stream',
+                name: 'client',
+                push: false,
+                raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+            )));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, $options);
+        $transport->setJetStreamContext($jetStream);
+
+        $transport->setup();
+
+        self::assertIsArray($payload);
+
+        return $payload;
+    }
+
+    /**
+     * nats-server rejects one STREAM.UPDATE that changes the placement and the replica count with
+     * err_code 10123. The transport cannot stage the two changes itself (see the transport's
+     * describeSetupRejection()), so the exception says how: it keeps the setup command's RuntimeException
+     * type and the server's wording, and carries the client exception as its direct previous, so the
+     * err_code stays readable to whoever catches it.
+     */
+    public function testSetupExplainsHowToStageAMoveAndScaleRejection(): void
+    {
+        $rejection = new JetStreamException('can not move and scale a stream in a single update', 400, null, 10123);
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [
+            'stream_placement_tags' => 'ssd',
+            'stream_replicas' => 3,
+        ]);
+        $transport->setJetStreamContext($this->jetStreamRejectingTheUpdate($rejection));
+
+        try {
+            $transport->setup();
+            self::fail('setup() was expected to fail.');
+        } catch (\RuntimeException $exception) {
+            self::assertStringStartsWith(
+                "Failed to setup NATS stream 'test-stream': can not move and scale a stream in a single update. NATS refuses to change the placement and the replica count of a stream in one update. Stage the two changes:",
+                $exception->getMessage(),
+            );
+            self::assertStringContainsString('stream_replicas', $exception->getMessage());
+            self::assertStringContainsString('"nats stream info"', $exception->getMessage());
+            self::assertStringContainsString('With auto_setup every send() and get() repeats this update', $exception->getMessage());
+            self::assertSame(0, $exception->getCode());
+            self::assertSame($rejection, $exception->getPrevious());
+        }
+    }
+
+    /**
+     * The staging advice is keyed on the err_code alone, so every other rejection of the update keeps the
+     * plain wording with the server's message, a placement no server can satisfy included.
+     */
+    public function testSetupKeepsThePlainWordingForOtherUpdateRejections(): void
+    {
+        $rejection = new JetStreamException('no suitable peers for placement, tags not matched [nvme]', 400, null, 10005);
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['stream_placement_tags' => 'nvme']);
+        $transport->setJetStreamContext($this->jetStreamRejectingTheUpdate($rejection));
+
+        try {
+            $transport->setup();
+            self::fail('setup() was expected to fail.');
+        } catch (\RuntimeException $exception) {
+            self::assertSame(
+                "Failed to setup NATS stream 'test-stream': no suitable peers for placement, tags not matched [nvme]",
+                $exception->getMessage(),
+            );
+            self::assertSame($rejection, $exception->getPrevious());
+        }
+    }
+
+    /**
+     * With auto_setup the done flag latches only after setup() succeeds, so a rejected move-and-scale
+     * update is repeated by every send() until the operator stages the configuration, and nothing is
+     * published meanwhile. Once the update goes through, the flag latches and the next send() skips
+     * setup() as usual.
+     */
+    public function testAutoSetupRepeatsARejectedMoveAndScaleUpdateOnEverySend(): void
+    {
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('encode')->willReturn(['body' => 'encoded']);
+
+        $jetStream = $this->jetStreamRejectingTheUpdateTwice();
+        $jetStream->expects(self::exactly(2))->method('publish')->willReturn(Future::complete());
+        $jetStream->expects(self::never())->method('fetchBatch');
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [
+            'auto_setup' => true,
+            'stream_placement_tags' => 'ssd',
+            'stream_replicas' => 3,
+        ], $serializer);
+        $transport->setJetStreamContext($jetStream);
+
+        foreach ([1, 2] as $attempt) {
+            try {
+                $transport->send(new Envelope(new \stdClass()));
+                self::fail("send() number {$attempt} was expected to fail while provisioning.");
+            } catch (\RuntimeException $exception) {
+                self::assertStringContainsString('Stage the two changes', $exception->getMessage());
+            }
+        }
+
+        // The operator staged the configuration, so the update goes through: this send() provisions and
+        // publishes, and the one after it publishes without provisioning again.
+        $transport->send(new Envelope(new \stdClass()));
+        $transport->send(new Envelope(new \stdClass()));
+    }
+
+    /**
+     * The get() side of the previous test: a worker on a rejected configuration fails every pull without
+     * fetching, then recovers once the update is accepted.
+     */
+    public function testAutoSetupRepeatsARejectedMoveAndScaleUpdateOnEveryGet(): void
+    {
+        $jetStream = $this->jetStreamRejectingTheUpdateTwice();
+        $jetStream->expects(self::exactly(2))->method('fetchBatch')->willReturn(Future::complete([]));
+        $jetStream->expects(self::never())->method('publish');
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [
+            'auto_setup' => true,
+            'stream_placement_tags' => 'ssd',
+            'stream_replicas' => 3,
+        ]);
+        $transport->setJetStreamContext($jetStream);
+
+        foreach ([1, 2] as $attempt) {
+            try {
+                iterator_to_array($transport->get());
+                self::fail("get() number {$attempt} was expected to fail while provisioning.");
+            } catch (\RuntimeException $exception) {
+                self::assertStringContainsString('Stage the two changes', $exception->getMessage());
+            }
+        }
+
+        self::assertSame([], iterator_to_array($transport->get()));
+        self::assertSame([], iterator_to_array($transport->get()));
+    }
+
+    /**
+     * A JetStream double for a stream that exists with an R1 placement on `hdd` and whose update is
+     * rejected with the given exception; the consumer is never created.
+     */
+    private function jetStreamRejectingTheUpdate(JetStreamException $rejection): JetStreamContext
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('addStream')
+            ->willReturn(Future::error(new JetStreamException('already exists', 0)));
+        $jetStream->expects(self::once())
+            ->method('getStream')
+            ->willReturn(Future::complete($this->pinnedR1StreamInfo()));
+        $jetStream->expects(self::once())
+            ->method('updateStream')
+            ->willReturn(Future::error($rejection));
+        $jetStream->expects(self::never())->method('addConsumer');
+
+        return $jetStream;
+    }
+
+    /**
+     * A JetStream double whose update is rejected with err_code 10123 twice and accepted the third time,
+     * for three provisioning attempts in all; the consumer is created once, after the accepted update.
+     */
+    private function jetStreamRejectingTheUpdateTwice(): JetStreamContext&\PHPUnit\Framework\MockObject\MockObject
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(3))
+            ->method('addStream')
+            ->willReturnCallback(static fn (): Future => Future::error(new JetStreamException('already exists', 0)));
+        $jetStream->expects(self::exactly(3))
+            ->method('getStream')
+            ->willReturnCallback(fn (): Future => Future::complete($this->pinnedR1StreamInfo()));
+        $jetStream->expects(self::exactly(3))
+            ->method('updateStream')
+            ->willReturnOnConsecutiveCalls(
+                Future::error(new JetStreamException('can not move and scale a stream in a single update', 400, null, 10123)),
+                Future::error(new JetStreamException('can not move and scale a stream in a single update', 400, null, 10123)),
+                Future::complete(),
+            );
+        $jetStream->expects(self::once())
+            ->method('addConsumer')
+            ->willReturn(Future::complete(new ConsumerInfo(
+                streamName: 'test-stream',
+                name: 'client',
+                push: false,
+                raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+            )));
+
+        return $jetStream;
+    }
+
+    private function pinnedR1StreamInfo(): StreamInfo
+    {
+        return new StreamInfo(
+            name: 'test-stream',
+            subjects: ['test-topic'],
+            raw: [
+                'config' => [
+                    'name' => 'test-stream',
+                    'subjects' => ['test-topic'],
+                    'storage' => 'file',
+                    'num_replicas' => 1,
+                    'placement' => ['tags' => ['hdd']],
+                ],
+            ],
+        );
+    }
+
+    /**
+     * A failure that is not a JetStream API rejection, here a lost connection while provisioning, keeps
+     * the plain wrap: the setup command's RuntimeException naming the stream, the cause's message, code 0
+     * and the cause as the previous exception. JetStream rejections take their own arm, see
+     * testSetupKeepsThePlainWordingForOtherUpdateRejections.
+     */
+    public function testSetupWrapsAFailureThatIsNotAJetStreamRejectionWithThePlainWording(): void
+    {
+        $cause = new ConnectionException('connection refused');
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('addStream')->willReturn(Future::error($cause));
+        $jetStream->expects(self::never())->method('getStream');
+        $jetStream->expects(self::never())->method('addConsumer');
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        try {
+            $transport->setup();
+            self::fail('setup() was expected to fail.');
+        } catch (\RuntimeException $exception) {
+            self::assertSame("Failed to setup NATS stream 'test-stream': connection refused", $exception->getMessage());
+            self::assertSame(0, $exception->getCode());
+            self::assertSame($cause, $exception->getPrevious());
+        }
+    }
+
+    /**
+     * With `reconnect: true` the client owns the recovery of a lost connection, and a client in the middle of it
+     * is left alone: the operation neither PINGs nor dials, though the connection sat idle past ping_after_idle,
+     * and goes out on the connection the client is making. Without the option a Connecting client would be
+     * checked like any other, which stops its recovery with a dial of the transport's own.
+     */
+    public function testReconnectModeLeavesAClientInTheMiddleOfItsRecoveryAlone(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('ack')->willReturn(Future::complete());
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+        $client->expects(self::never())->method('rtt');
+        $client->expects(self::never())->method('disconnect');
+        $client->expects(self::never())->method('statistics');
+
+        $transport = new ClockedNatsTransport(self::VALID_DSN, ['reconnect' => true, 'ping_after_idle' => 30]);
+        $transport->setClient($client);
+        $envelope = (new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('reply-token'));
+        $transport->ack($envelope);
+
+        $state = ConnectionState::Connecting;
+        $transport->now += 31;
+        $transport->ack($envelope);
+    }
+
+    /**
+     * With `reconnect: true` a failed PING is read against what the client made of the connection, by its state and
+     * its reconnect count from before the PING: a client that is recovering, or that already recovered (the PONG
+     * belonged to the lost connection), keeps the connection; a client that still reports the same connection Open
+     * is replaced, as without the option, since nothing in it recovers a connection it does not know to be lost;
+     * a client that gave up is Closed and dialled again.
+     */
+    #[DataProvider('failedPingOutcomes')]
+    public function testReconnectModeReadsAFailedPingAgainstTheClientsRecovery(ConnectionState $stateAfterPing, int $reconnectsAfterPing, string $outcome): void
+    {
+        $kept = $outcome === 'kept';
+        $oldConnection = $this->createMock(JetStreamContext::class);
+        $oldConnection->expects(self::exactly($kept ? 2 : 1))->method('ack')->willReturn(Future::complete());
+        $newConnection = $this->createMock(JetStreamContext::class);
+        $newConnection->expects(self::exactly($kept ? 0 : 1))->method('ack')->willReturn(Future::complete());
+
+        $state = ConnectionState::Idle;
+        $reconnects = 0;
+        $client = $this->clientReportingState($state, $kept ? [Future::complete()] : [Future::complete(), Future::complete()]);
+        $client->method('jetStream')->willReturnOnConsecutiveCalls($oldConnection, $newConnection);
+        $client->method('statistics')->willReturnCallback(static function () use (&$reconnects): ConnectionStats {
+            return new ConnectionStats(0, 0, 0, 0, $reconnects);
+        });
+        $client->expects(self::once())->method('rtt')->willReturnCallback(
+            static function () use (&$state, &$reconnects, $stateAfterPing, $reconnectsAfterPing): Future {
+                $state = $stateAfterPing;
+                $reconnects = $reconnectsAfterPing;
+
+                return Future::error(new ConnectionException('Broken pipe'));
+            },
+        );
+        $client->expects($outcome === 'replaced' ? self::once() : self::never())->method('disconnect')->willReturn(Future::complete());
+
+        $transport = new ClockedNatsTransport(self::VALID_DSN, ['reconnect' => true, 'ping_after_idle' => 30]);
+        $transport->setClient($client);
+        $envelope = (new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('reply-token'));
+        $transport->ack($envelope);
+
+        $transport->now += 31;
+        $transport->ack($envelope);
+    }
+
+    /**
+     * @return iterable<string, array{ConnectionState, int, string}>
+     */
+    public static function failedPingOutcomes(): iterable
+    {
+        yield 'the client is recovering: kept, the operation waits for the recovery' => [ConnectionState::Connecting, 0, 'kept'];
+        yield 'the client already recovered: kept, the PONG belonged to the lost connection' => [ConnectionState::Open, 1, 'kept'];
+        yield 'the same connection, silent: replaced, as without the option' => [ConnectionState::Open, 0, 'replaced'];
+        yield 'the recovery gave up: dialled again, nothing to disconnect' => [ConnectionState::Closed, 0, 'redialled'];
+    }
+
+    /**
+     * A connection the client recovered behind the failed PING counts as checked: the operation after it does not
+     * PING again, though the check was armed by a failure.
+     */
+    public function testReconnectModeTakesARecoveredConnectionAsChecked(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(3))->method('ack')->willReturnOnConsecutiveCalls(
+            Future::error(new ConnectionException('Connection lost')),
+            Future::complete(),
+            Future::complete(),
+        );
+
+        $state = ConnectionState::Idle;
+        $reconnects = 0;
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+        $client->method('statistics')->willReturnCallback(static function () use (&$reconnects): ConnectionStats {
+            return new ConnectionStats(0, 0, 0, 0, $reconnects);
+        });
+        $client->expects(self::once())->method('rtt')->willReturnCallback(static function () use (&$reconnects): Future {
+            $reconnects = 1;
+
+            return Future::error(new ConnectionException('Broken pipe'));
+        });
+        $client->expects(self::never())->method('disconnect');
+
+        $transport = new RealConnectNatsTransport(self::VALID_DSN, ['reconnect' => true]);
+        $transport->setClient($client);
+        $envelope = (new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('reply-token'));
+        try {
+            $transport->ack($envelope);
+            self::fail('The first ack was expected to fail on the connection.');
+        } catch (ConnectionException) {
+        }
+
+        $transport->ack($envelope);
+        $transport->ack($envelope);
+    }
+
+    /**
+     * Without the option nothing changes: a failed PING replaces the connection, and the client's reconnect count
+     * is never read. The count belongs to the client's recovery, which the default mode does not use.
+     */
+    public function testWithoutReconnectAFailedPingReplacesTheConnectionAndTheReconnectCountIsNeverRead(): void
+    {
+        $oldConnection = $this->createMock(JetStreamContext::class);
+        $oldConnection->expects(self::once())->method('ack')->willReturn(Future::complete());
+        $newConnection = $this->createMock(JetStreamContext::class);
+        $newConnection->expects(self::once())->method('ack')->willReturn(Future::complete());
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete(), Future::complete()]);
+        $client->method('jetStream')->willReturnOnConsecutiveCalls($oldConnection, $newConnection);
+        $client->expects(self::never())->method('statistics');
+        $client->expects(self::once())->method('rtt')->willReturnCallback(static function () use (&$state): Future {
+            $state = ConnectionState::Connecting;
+
+            return Future::error(new ConnectionException('Broken pipe'));
+        });
+        $client->expects(self::once())->method('disconnect')->willReturn(Future::complete());
+
+        $transport = new ClockedNatsTransport(self::VALID_DSN, ['ping_after_idle' => 30]);
+        $transport->setClient($client);
+        $envelope = (new Envelope(new \stdClass()))->with(new TransportMessageIdStamp('reply-token'));
+        $transport->ack($envelope);
+
+        $transport->now += 31;
+        $transport->ack($envelope);
+    }
+
+    /**
+     * With `reconnect: true` and auto_setup, provisioning is verified again once the client reconnected on its own:
+     * the done flag alone is not trusted, since the client replaced the connection behind the transport's back and
+     * the stream may have gone with the server. Verified before the operation, for a send and for a pull; an
+     * operation with the count unchanged does not provision again.
+     *
+     * @param \Closure(NatsTransport): void $operation
+     */
+    #[DataProvider('operationsAfterAReconnect')]
+    public function testReconnectModeVerifiesProvisioningAgainAfterTheClientReconnected(string $method, mixed $result, \Closure $operation): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::exactly(2))->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $jetStream->expects(self::exactly(3))->method($method)->willReturn(Future::complete($result));
+
+        $reconnects = 0;
+        $transport = $this->reconnectModeTransport($jetStream, $reconnects, ['auto_setup' => true]);
+
+        $operation($transport);
+        $reconnects = 1;
+        $operation($transport);
+        $operation($transport);
+    }
+
+    /**
+     * @return iterable<string, array{string, mixed, \Closure(NatsTransport): void}>
+     */
+    public static function operationsAfterAReconnect(): iterable
+    {
+        yield 'send' => ['publish', null, static fn (NatsTransport $transport) => $transport->send(new Envelope(new \stdClass()))];
+        yield 'get' => ['fetchBatch', [], static fn (NatsTransport $transport) => iterator_to_array($transport->get())];
+    }
+
+    /**
+     * A send begun while the client recovers passes the provisioning check with the old count, waits for the
+     * recovery inside the publish, and lands on a server without the stream: the client's 503 "No JetStream
+     * responder". With auto_setup on and the count moved, setup() runs once and the same frame is published once
+     * more, with the same subject, payload, headers and Nats-Msg-Id, so a delayed message keeps its schedule and a
+     * deduplicated one its id. Nothing answered the first publish, so the second cannot duplicate it.
+     *
+     * @param array<string, mixed> $options
+     * @param list<StampInterface> $stamps
+     */
+    #[DataProvider('publishesAfterAReconnect')]
+    public function testReconnectModeReprovisionsOnceWhenTheFirstPublishAfterTheReconnectFindsNoResponder(array $options, array $stamps, ?string $expectedSubjectPrefix, bool $expectsMessageId): void
+    {
+        $publishes = [];
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::exactly(2))->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $reconnects = 0;
+        $jetStream->expects(self::exactly(2))->method('publish')->willReturnCallback(
+            static function (string $subject, string $payload, array $headers, ?string $msgId) use (&$publishes, &$reconnects): Future {
+                $publishes[] = [$subject, $payload, $headers, $msgId];
+                if (count($publishes) === 1) {
+                    // The recovery completed inside this publish's wait, on a server without the stream.
+                    $reconnects = 1;
+
+                    return Future::error(new JetStreamException('No JetStream responder for subject ' . $subject, 503));
+                }
+
+                return Future::complete();
+            },
+        );
+
+        $transport = $this->reconnectModeTransport($jetStream, $reconnects, ['auto_setup' => true] + $options);
+        $transport->send(new Envelope(new \stdClass(), $stamps));
+
+        self::assertCount(2, $publishes);
+        self::assertSame($publishes[0], $publishes[1], 'the second publish is the first frame again');
+        if ($expectedSubjectPrefix !== null) {
+            self::assertStringStartsWith($expectedSubjectPrefix, $publishes[0][0]);
+        }
+        self::assertSame($expectsMessageId, $publishes[0][3] !== null, 'Nats-Msg-Id present as the options and stamps say');
+    }
+
+    /**
+     * @return iterable<string, array{array<string, mixed>, list<StampInterface>, ?string, bool}>
+     */
+    public static function publishesAfterAReconnect(): iterable
+    {
+        yield 'plain, no deduplication' => [[], [], 'test-topic', false];
+        yield 'deduplicate on' => [['deduplicate' => true], [], 'test-topic', true];
+        yield 'application-supplied deduplication id' => [[], [new DeduplicationIdStamp('order-7')], 'test-topic', true];
+        yield 'delayed message keeps its scheduled subject' => [['scheduled_messages' => true], [new DelayStamp(5000)], 'test-topic.delayed.', false];
+    }
+
+    /**
+     * The retry is one setup() and one publish: a second 503 propagates, as the client's exception.
+     */
+    public function testReconnectModeReprovisionsOnlyOnceForAPublishWithoutAResponder(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::exactly(2))->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $reconnects = 0;
+        $jetStream->expects(self::exactly(2))->method('publish')->willReturnCallback(static function () use (&$reconnects): Future {
+            $reconnects = 1;
+
+            return Future::error(new JetStreamException('No JetStream responder for subject test-topic', 503));
+        });
+
+        $transport = $this->reconnectModeTransport($jetStream, $reconnects, ['auto_setup' => true]);
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('No JetStream responder for subject test-topic');
+
+        $transport->send(new Envelope(new \stdClass()));
+    }
+
+    /**
+     * The retry needs all three: the no-responder reply, auto_setup, and a reconnect since the last setup(). A 503
+     * with the count unchanged, a 503 without auto_setup, and another JetStream reply after a reconnect all
+     * propagate at once, with no second setup() and no second publish.
+     *
+     * @param array<string, mixed> $options
+     */
+    #[DataProvider('publishFailuresNotRetried')]
+    public function testReconnectModeDoesNotRetryAPublishOutsideTheNoResponderCase(array $options, int $reconnectsDuringPublish, JetStreamException $reply): void
+    {
+        $autoSetup = $options['auto_setup'] ?? false;
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects($autoSetup ? self::once() : self::never())->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects($autoSetup ? self::once() : self::never())->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $reconnects = 0;
+        $jetStream->expects(self::once())->method('publish')->willReturnCallback(static function () use (&$reconnects, $reconnectsDuringPublish, $reply): Future {
+            $reconnects = $reconnectsDuringPublish;
+
+            return Future::error($reply);
+        });
+
+        $transport = $this->reconnectModeTransport($jetStream, $reconnects, $options);
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage($reply->getMessage());
+
+        $transport->send(new Envelope(new \stdClass()));
+    }
+
+    /**
+     * @return iterable<string, array{array<string, mixed>, int, JetStreamException}>
+     */
+    public static function publishFailuresNotRetried(): iterable
+    {
+        yield 'no responder, but the client did not reconnect' => [['auto_setup' => true], 0, new JetStreamException('No JetStream responder for subject test-topic', 503)];
+        yield 'no responder after a reconnect, without auto_setup' => [[], 1, new JetStreamException('No JetStream responder for subject test-topic', 503)];
+        yield 'another reply after a reconnect' => [['auto_setup' => true], 1, new JetStreamException('maximum messages exceeded', 400, null, 10077)];
+    }
+
+    /**
+     * Without the option, a 503 from the publish propagates as it always did and the reconnect count is never read:
+     * the transport replaces connections itself there, and clears the done flag when it does.
+     */
+    public function testWithoutReconnectAPublishWithoutAResponderPropagatesAndTheReconnectCountIsNeverRead(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::once())->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $jetStream->expects(self::once())->method('publish')->willReturn(Future::error(new JetStreamException('No JetStream responder for subject test-topic', 503)));
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+        $client->expects(self::never())->method('statistics');
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('encode')->willReturn(['body' => 'encoded']);
+        $transport = new RealConnectNatsTransport(self::VALID_DSN, ['auto_setup' => true], $serializer);
+        $transport->setClient($client);
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('No JetStream responder for subject test-topic');
+
+        $transport->send(new Envelope(new \stdClass()));
+    }
+
+    /**
+     * A transport with `reconnect: true` over a mocked Open client whose reconnect count the test moves, with the
+     * given JetStream double and an encoder that returns a fixed body.
+     *
+     * @param array<string, mixed> $options
+     */
+    private function reconnectModeTransport(JetStreamContext $jetStream, int &$reconnects, array $options): RealConnectNatsTransport
+    {
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+        $client->method('statistics')->willReturnCallback(static function () use (&$reconnects): ConnectionStats {
+            return new ConnectionStats(0, 0, 0, 0, $reconnects);
+        });
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('encode')->willReturn(['body' => 'encoded']);
+        $transport = new RealConnectNatsTransport(self::VALID_DSN, ['reconnect' => true] + $options, $serializer);
+        $transport->setClient($client);
+
+        return $transport;
+    }
+
+    private function consumerInfo(): ConsumerInfo
+    {
+        return new ConsumerInfo(
+            streamName: 'test-stream',
+            name: 'client',
+            push: false,
+            raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+        );
+    }
+
+    /**
+     * A server that is shutting down ends every pull in flight with "409 Server Shutdown". The consumer is not
+     * missing, so the pull is an empty batch, with and without auto_setup: with it, setup() no longer runs against
+     * the server that is going away. The server closes the connection right after, so the next operation checks it
+     * first, as after any failure on it, and runs on a new one when the PING goes unanswered.
+     *
+     * @param array<string, mixed> $options
+     */
+    #[DataProvider('autoSetupOnAndOff')]
+    public function testAPullTheServerEndedForItsShutdownIsEmptyAndTheNextOperationChecksTheConnection(array $options): void
+    {
+        $autoSetup = $options['auto_setup'] ?? false;
+        $oldConnection = $this->createMock(JetStreamContext::class);
+        $oldConnection->expects($autoSetup ? self::once() : self::never())->method('addStream')->willReturn(Future::complete());
+        $oldConnection->expects($autoSetup ? self::once() : self::never())->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $oldConnection->expects(self::once())->method('fetchBatch')->willReturn(
+            Future::error(new JetStreamException('JetStream pull request ended with status 409: Server Shutdown', 409)),
+        );
+        $newConnection = $this->createMock(JetStreamContext::class);
+        $newConnection->expects($autoSetup ? self::once() : self::never())->method('addStream')->willReturn(Future::complete());
+        $newConnection->expects($autoSetup ? self::once() : self::never())->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $newConnection->expects(self::once())->method('fetchBatch')->willReturn(Future::complete([]));
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete(), Future::complete()]);
+        $client->expects(self::exactly(2))->method('jetStream')->willReturnOnConsecutiveCalls($oldConnection, $newConnection);
+        $client->expects(self::once())->method('rtt')->willReturn(Future::error(new ConnectionException('Connection lost')));
+        $client->expects(self::once())->method('disconnect')->willReturn(Future::complete());
+
+        $transport = new RealConnectNatsTransport(self::VALID_DSN, $options);
+        $transport->setClient($client);
+
+        self::assertSame([], iterator_to_array($transport->get()), 'the pull the server ended is an empty batch');
+        self::assertSame([], iterator_to_array($transport->get()), 'the next pull checked the connection and ran on a new one');
+    }
+
+    /**
+     * @return iterable<string, array{array<string, mixed>}>
+     */
+    public static function autoSetupOnAndOff(): iterable
+    {
+        yield 'auto_setup on' => [['auto_setup' => true]];
+        yield 'auto_setup off' => [[]];
+    }
+
+    /**
+     * A consumer whose leader moved ends the pull with "409 Leadership Change": an empty batch, and the connection
+     * is fine, so the next pull owes no check.
+     */
+    public function testAPullEndedByALeadershipChangeIsEmptyAndTheNextOneDoesNotCheckTheConnection(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::once())->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $jetStream->expects(self::exactly(2))->method('fetchBatch')->willReturnOnConsecutiveCalls(
+            Future::error(new JetStreamException('JetStream pull request ended with status 409: Leadership Change', 409)),
+            Future::complete([]),
+        );
+
+        $state = ConnectionState::Idle;
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+        $client->expects(self::never())->method('rtt');
+        $client->expects(self::never())->method('disconnect');
+
+        $transport = new RealConnectNatsTransport(self::VALID_DSN, ['auto_setup' => true]);
+        $transport->setClient($client);
+
+        self::assertSame([], iterator_to_array($transport->get()));
+        self::assertSame([], iterator_to_array($transport->get()));
+    }
+
+    /**
+     * A shutdown can end the retried pull after re-provisioning as well: it is as empty there as on the first try,
+     * rather than a repeated 409 that propagates.
+     */
+    public function testAShutdownEndingTheRetriedPullAfterReprovisioningIsEmptyToo(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::exactly(2))->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $jetStream->expects(self::exactly(2))->method('fetchBatch')->willReturnOnConsecutiveCalls(
+            Future::error(new JetStreamException('JetStream pull request ended with status 409: Consumer Deleted', 409)),
+            Future::error(new JetStreamException('JetStream pull request ended with status 409: Server Shutdown', 409)),
+        );
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['auto_setup' => true]);
+        $transport->setJetStreamContext($jetStream);
+
+        self::assertSame([], iterator_to_array($transport->get()));
+    }
+
+    /**
+     * The 409s that report a configuration error keep their meaning. Without auto_setup they propagate; with it the
+     * consumer is provisioned once and the repeated 409 propagates, since no amount of polling heals a pull from a
+     * push consumer or a batch above the consumer's maximum, and an empty batch would hide the misconfiguration.
+     *
+     * @param array<string, mixed> $options
+     */
+    #[DataProvider('configurationErrorPullStatuses')]
+    public function testA409ReportingAConfigurationErrorStaysVisible(array $options, string $description): void
+    {
+        $autoSetup = $options['auto_setup'] ?? false;
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly($autoSetup ? 2 : 0))->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::exactly($autoSetup ? 2 : 0))->method('addConsumer')->willReturn(Future::complete($this->consumerInfo()));
+        $jetStream->expects(self::exactly($autoSetup ? 2 : 1))->method('fetchBatch')->willReturnCallback(
+            static fn (): Future => Future::error(new JetStreamException('JetStream pull request ended with status 409: ' . $description, 409)),
+        );
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, $options);
+        $transport->setJetStreamContext($jetStream);
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage($description);
+
+        iterator_to_array($transport->get());
+    }
+
+    /**
+     * @return iterable<string, array{array<string, mixed>, string}>
+     */
+    public static function configurationErrorPullStatuses(): iterable
+    {
+        foreach (['Consumer is push based', 'Exceeded MaxRequestBatch of 1'] as $description) {
+            yield $description . ', auto_setup off' => [[], $description];
+            yield $description . ', auto_setup on' => [['auto_setup' => true], $description];
+        }
+    }
+
+    /**
+     * The two readings belong to a 409: another status whose description happens to name a shutdown is what it was,
+     * here a 503 that propagates without auto_setup.
+     */
+    public function testOnlyA409CarriesTheServerEndedReadings(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('fetchBatch')->willReturn(
+            Future::error(new JetStreamException('JetStream pull request ended with status 503: Server Shutdown', 503)),
+        );
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('status 503: Server Shutdown');
+
+        iterator_to_array($transport->get());
     }
 }
