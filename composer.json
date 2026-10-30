@@ -1,6 +1,6 @@
 {
-    "name": "idct/symfony-nats-messenger",
-    "description": "Symfony NATS (JetStream) Messenger Bridge",
+    "name": "recisio/symfony-nats-messenger",
+    "description": "Symfony NATS (JetStream) Messenger Bridge with PHP 8.1 compatibility",
     "type": "symfony-bundle",
     "license": "MIT",
     "autoload": {
@@ -21,20 +21,23 @@
             "infection/extension-installer": true
         }
     },
+    "replace": {
+        "idct/symfony-nats-messenger": "self.version"
+    },
     "require": {
-        "php": "^8.2",
-        "symfony/framework-bundle": "^7 || ^8",
-        "symfony/messenger": "^7.2 || ^8.0",
-        "idct/php-nats-jetstream-client": "^2.27.1",
-        "symfony/uid": "^7.2 || ^8.0",
+        "php": "^8.1",
+        "symfony/framework-bundle": "^6.4 || ^7 || ^8",
+        "symfony/messenger": "^6.4 || ^7.2 || ^8.0",
+        "recisio/php-nats-jetstream-client": "dev-main",
+        "symfony/uid": "^6.4 || ^7.2 || ^8.0",
         "psr/log": "^3.0"
     },
     "require-dev": {
-        "behat/behat": "^4.0",
-        "phpunit/phpunit": "^11.5 || ^12.5 || ^13.4",
+        "behat/behat": "^3.29 || ^4.0",
+        "phpunit/phpunit": "^10.5 || ^11.5 || ^12.5 || ^13.4",
         "phpstan/phpstan": "^2.3",
-        "dg/bypass-finals": "^1.11",
-        "infection/infection": "^0.32 || ^0.33 || ^0.34 || ^0.35"
+        "dg/bypass-finals": "^1.9",
+        "infection/infection": "^0.29 || ^0.30 || ^0.31 || ^0.32 || ^0.33 || ^0.34 || ^0.35"
     },
     "scripts": {
         "analyse": "phpstan analyse --configuration phpstan.neon.dist",

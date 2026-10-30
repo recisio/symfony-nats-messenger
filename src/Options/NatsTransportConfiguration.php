@@ -21,7 +21,7 @@ use IDCT\NatsMessenger\TypeCoercion;
  * @see NatsTransportConfigurationBuilder Builds instances of this class.
  * @see TransportOption                  Enum of all recognized option keys.
  */
-final readonly class NatsTransportConfiguration
+final class NatsTransportConfiguration
 {
     /**
      * @param string               $topic                   JetStream subject name
@@ -35,15 +35,15 @@ final readonly class NatsTransportConfiguration
      * @param bool                 $deduplicationEnabled    True when every published message gets an id JetStream deduplicates it by
      */
     public function __construct(
-        public string $topic,
-        public string $streamName,
-        public NatsClient $client,
-        private array $options,
-        private bool $natsRetryHandlerEnabled,
-        private bool $scheduledMessagesEnabled = false,
-        private bool $ackSyncEnabled = false,
-        private bool $autoSetupEnabled = false,
-        private bool $deduplicationEnabled = false,
+        public readonly string $topic,
+        public readonly string $streamName,
+        public readonly NatsClient $client,
+        private readonly array $options,
+        private readonly bool $natsRetryHandlerEnabled,
+        private readonly bool $scheduledMessagesEnabled = false,
+        private readonly bool $ackSyncEnabled = false,
+        private readonly bool $autoSetupEnabled = false,
+        private readonly bool $deduplicationEnabled = false,
     ) {
     }
 

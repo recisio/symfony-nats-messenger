@@ -12,20 +12,16 @@ jobs:
     # name of the check.
     name: test (${{ matrix.php-version }}, ${{ matrix.client }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40  # Whole-job cap: install + analysis + unit/coverage + mutation (8.5) + functional + benchmark
+    timeout-minutes: 40  # Whole-job cap: install + analysis + unit/coverage + mutation (8.2) + functional + benchmark
 
-    # The oldest PHP runs against the lowest client release the transport allows, the newest PHP against
-    # the latest client release, so CI tests the client versions users install (#52).
-    strategy:
+        strategy:
       matrix:
+        # Test 8.1 and 8.2 for now. The client is the recisio fork's dev-main, so there is no lowest release to test.
         include:
-          - php-version: '8.2'
-            client: lowest
-          - php-version: '8.5'
+          - php-version: '8.1'
             client: latest
-            # PHPUnit 12 and later report a test double that sets no expectations as a PHPUnit notice, and a
-            # notice alone does not fail the run. PHPUnit 11, which PHP 8.2 installs, has no such option.
-            phpunit-args: --fail-on-phpunit-notice
+          - php-version: '8.2'
+            client: latest
 
     steps:
     - name: Checkout code
@@ -60,10 +56,10 @@ jobs:
 
     - name: Use the lowest client release the transport allows
       if: matrix.client == 'lowest'
-      run: composer update idct/php-nats-jetstream-client --prefer-lowest --prefer-dist --no-progress
+      run: composer update recisio/php-nats-jetstream-client --prefer-lowest --prefer-dist --no-progress
 
     - name: Show the client release under test
-      run: composer show idct/php-nats-jetstream-client | grep -E '^versions'
+      run: composer show recisio/php-nats-jetstream-client | grep -E '^versions'
 
     - name: Run static analysis and fast unit tests
       run: composer test
@@ -103,21 +99,21 @@ jobs:
     # Mutants that change nothing must all escape. One that is detected shows that the mutant processes do
     # not run the tests the way a plain run does, and the score of the run below would mean nothing.
     - name: Check that mutant processes run the tests like a plain run
-      if: matrix.php-version == '8.5'
+      if: matrix.php-version == '8.2'
       run: composer test:mutation:canary
 
     - name: Run mutation tests
-      if: matrix.php-version == '8.5'
+      if: matrix.php-version == '8.2'
       run: composer test:mutation
 
     - name: Check that no mutant was killed by the test harness
-      if: matrix.php-version == '8.5'
+      if: matrix.php-version == '8.2'
       run: composer test:mutation:check-log
 
     # The console names no test that killed a mutant; infection.log holds the output of every mutant of the
     # failed run, the canary's or the real one's.
     - name: Upload Infection log on failure
-      if: failure() && matrix.php-version == '8.5'
+      if: failure() && matrix.php-version == '8.2'
       uses: actions/upload-artifact@v7
       with:
         name: infection-log
@@ -131,15 +127,15 @@ jobs:
     - name: Use the lowest client release in the functional test app
       if: matrix.client == 'lowest'
       working-directory: tests/functional
-      run: composer update idct/php-nats-jetstream-client --prefer-lowest --prefer-dist --no-progress
+      run: composer update recisio/php-nats-jetstream-client --prefer-lowest --prefer-dist --no-progress
 
     # The functional test app installs the client on its own, so make sure it runs the release the unit tests
     # above ran: otherwise the job would report the lowest release as tested while running another.
     - name: Check the functional test app runs the client release under test
       working-directory: tests/functional
       run: |
-        APP=$(composer show idct/php-nats-jetstream-client | awk '/^versions/ {print $NF}')
-        ROOT=$(composer --working-dir=../.. show idct/php-nats-jetstream-client | awk '/^versions/ {print $NF}')
+        APP=$(composer show recisio/php-nats-jetstream-client | awk '/^versions/ {print $NF}')
+        ROOT=$(composer --working-dir=../.. show recisio/php-nats-jetstream-client | awk '/^versions/ {print $NF}')
         echo "functional test app: client $APP; unit tests: client $ROOT"
         [ "$APP" = "$ROOT" ] || { echo "::error::The functional test app runs client $APP, the unit tests ran $ROOT"; exit 1; }
 
@@ -182,7 +178,7 @@ jobs:
 
     - name: Upload coverage reports
       uses: actions/upload-artifact@v7
-      if: matrix.php-version == '8.5'
+      if: matrix.php-version == '8.2'
       with:
         name: coverage-report
         path: |
@@ -192,7 +188,7 @@ jobs:
 
     - name: Upload benchmark results
       uses: actions/upload-artifact@v7
-      if: matrix.php-version == '8.5'
+      if: matrix.php-version == '8.2'
       with:
         name: benchmark-results
         path: tests/functional/benchmark-*.txt

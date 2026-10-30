@@ -9,6 +9,6 @@ final class Application extends BaseApplication
 {
     public function add(Command $command): ?Command
     {
-        return $this->addCommand($command);
+        return parent::add($command);
     }
 }

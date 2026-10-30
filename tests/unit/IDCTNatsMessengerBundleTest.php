@@ -106,7 +106,7 @@ final class IDCTNatsMessengerBundleTest extends TestCase
         $kernel = $this->kernel([], ['transports' => ['nats' => self::NATS_DSN]]);
 
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('No transport supports Messenger DSN');
+        $this->expectExceptionMessageMatches('/No transport supports (the given )?Messenger DSN/');
 
         $kernel->testContainer()->get('messenger.transport.nats');
     }

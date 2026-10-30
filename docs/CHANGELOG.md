@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (recisio fork)
+- **Fork packaging** — Renamed the distributable package to `recisio/symfony-nats-messenger` (with a
+  Composer `replace` entry for `idct/symfony-nats-messenger`), and required the
+  `recisio/php-nats-jetstream-client` fork's `dev-main` instead of a tagged `idct/php-nats-jetstream-client`
+  release: the upstream client requires PHP `^8.2`, which would defeat the point of this fork.
+- **PHP compatibility** — Lowered the minimum supported PHP version to 8.1: replaced the PHP 8.2-only
+  `readonly class NatsTransportConfiguration` with per-property `readonly` promoted properties, and turned
+  `NatsTransportConfigurationBuilder::DEFAULT_OPTIONS` from a class constant into a `defaultOptions()` static
+  method (PHP 8.1 doesn't allow enum-case `->value` access inside constant expressions). The
+  `#[\SensitiveParameter]` attributes are kept: PHP 8.1 ignores them.
+- **Symfony compatibility** — Expanded supported Symfony versions to include 6.4 for the package and the
+  functional test application. `NatsTransport` no longer implements `KeepaliveReceiverInterface` or
+  `CloseableTransportInterface`, which don't exist in Symfony 6.4; the `keepalive()`/`close()` methods are
+  unchanged, just no longer interface-bound. The functional app's `property_info.yaml` and
+  `Console/Application.php` were adjusted to their Symfony 6.4-compatible equivalents
+  (`enabled: true`, `parent::add($command)`).
+- **Retry in nats mode** — Symfony Messenger 6.4.49 acknowledges a message sent for retry instead of
+  rejecting it (symfony/symfony#67038). In nats mode the transport does not publish the retry copy (#47), so a
+  Symfony retry strategy with `max_retries` above 0 would lose the message: keep `max_retries` at 0 with
+  `retry_handler=nats`. `testWorkerRetryInNatsModeNaksTheOriginalWithoutPublishingACopy` is skipped for that
+  reason.
+- **Developer tooling** — Relaxed `phpunit/phpunit` to `^10.5`, `infection/infection` to `^0.29`,
+  `dg/bypass-finals` to `^1.9`, `behat/behat` to `^3.29` and the functional app's `symfony/maker-bundle` to
+  `^1.67` as lower bounds, so the test suites install on PHP 8.1.
+- **CI** — Matrix changed to PHP 8.1 and 8.2 against the client's `dev-main`; the mutation-testing steps and
+  the coverage/benchmark artifact uploads (previously gated on PHP 8.5) now run on PHP 8.2.
+
 ## [5.7.1] - 2026-10-19
 
 A **patch** release. It requires client 2.27.1, in which an acknowledgement whose write is the first to notice a
